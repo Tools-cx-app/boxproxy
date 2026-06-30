@@ -1,0 +1,6 @@
+#!/system/bin/sh
+
+BOX_HOME="${BOX_HOME:-/data/adb/box}"
+BOXCTL="${BOXCTL:-${BOX_HOME}/bin/boxctl}"
+
+exec "${BOXCTL}" --home "${BOX_HOME}" service "$@"
