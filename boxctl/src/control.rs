@@ -28,7 +28,6 @@ pub fn up(config: &Config, runner: &Runner) -> Result<()> {
         log_startup_failed(config, &err);
         return Err(err);
     }
-    wifi::record_current_wifi_state(config, runner);
     if let Err(err) = wifi::monitor(config, runner) {
         log_startup_failed(config, &err);
         return Err(err);
@@ -36,6 +35,16 @@ pub fn up(config: &Config, runner: &Runner) -> Result<()> {
 
     logger::info_key(config, LogKey::StartupCompleted, &[]);
     Ok(())
+}
+
+pub fn boot(config: &Config, runner: &Runner) -> Result<()> {
+    if config.wifi_network_control_enabled {
+        wifi::apply(config, runner)?;
+        wifi::monitor(config, runner)?;
+        return Ok(());
+    }
+
+    up(config, runner)
 }
 
 pub fn down(config: &Config, runner: &Runner) -> Result<()> {

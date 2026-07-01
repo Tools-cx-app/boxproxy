@@ -44,6 +44,7 @@ fn run() -> Result<()> {
 
     match cli.command {
         Command::Up => control::up(&config, &runner),
+        Command::Boot => control::boot(&config, &runner),
         Command::Down => control::down(&config, &runner),
         Command::Restart => control::restart(&config, &runner),
         Command::Status => control::status(&config, &runner),

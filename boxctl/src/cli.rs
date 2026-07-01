@@ -6,6 +6,7 @@ use std::process;
 #[derive(Debug)]
 pub(crate) enum Command {
     Up,
+    Boot,
     Down,
     Restart,
     Status,
@@ -229,6 +230,7 @@ fn parse_command(rest: &[String], overrides: &mut ConfigOverrides) -> Result<Com
     match rest {
         [cmd] => match cmd.as_str() {
             "up" => Ok(Command::Up),
+            "boot" => Ok(Command::Boot),
             "down" => Ok(Command::Down),
             "restart" => Ok(Command::Restart),
             "status" => Ok(Command::Status),
@@ -338,6 +340,7 @@ fn print_usage() {
     eprintln!(
         "Usage:
   boxctl [options] up [tun|tproxy|redirect|mixed|enhance]
+  boxctl [options] boot
   boxctl [options] down
   boxctl [options] restart [tun|tproxy|redirect|mixed|enhance]
   boxctl [options] status

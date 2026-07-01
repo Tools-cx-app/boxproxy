@@ -36,7 +36,7 @@
 #define PROBE_MAP_APP_UID PIN_DIR "/box_probe_app_uid"
 
 #define MAX_CIDRS 65536U
-#define MAX_UIDS 65536U
+#define MAX_UIDS 8192U
 #define MAX_PATH_LEN 512
 #define VERIFY_LOG_SIZE 65536
 
@@ -49,7 +49,6 @@ enum status_code {
 
 struct config {
     bool ipv6;
-    bool cidr_hit_is_match;
 
     char cidr4_file[MAX_PATH_LEN];
     char cidr6_file[MAX_PATH_LEN];
@@ -65,7 +64,6 @@ struct config {
     char pin_app_out4[MAX_PATH_LEN];
     char pin_app_out6[MAX_PATH_LEN];
 
-    char map_runtime[MAX_PATH_LEN];
     char map_cidr4[MAX_PATH_LEN];
     char map_cidr6[MAX_PATH_LEN];
     char map_force_uid[MAX_PATH_LEN];
@@ -94,7 +92,6 @@ void remove_known_pins(void);
 int load_program(
     const char *section_name,
     const char *program_name,
-    int runtime_fd,
     int cidr4_fd,
     int cidr6_fd,
     int force_uid_fd,

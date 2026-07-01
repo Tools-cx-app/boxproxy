@@ -6,11 +6,16 @@
 #include <linux/bpf.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
+static void raise_memlock(void) {
+    struct rlimit unlimited = {RLIM_INFINITY, RLIM_INFINITY};
+    setrlimit(RLIMIT_MEMLOCK, &unlimited);
+}
+
 struct fds {
-    int runtime;
     int cidr4;
     int cidr6;
     int force_uid;
@@ -18,7 +23,6 @@ struct fds {
 };
 
 static void init_fds(struct fds *fds) {
-    fds->runtime = -1;
     fds->cidr4 = -1;
     fds->cidr6 = -1;
     fds->force_uid = -1;
@@ -26,7 +30,6 @@ static void init_fds(struct fds *fds) {
 }
 
 static void close_fds(struct fds *fds) {
-    close_fd(fds->runtime);
     close_fd(fds->cidr4);
     close_fd(fds->cidr6);
     close_fd(fds->force_uid);
@@ -64,23 +67,6 @@ static void print_usage(const char *argv0) {
     );
 }
 
-static int create_runtime_map(const struct config *config, int *fd_out) {
-    *fd_out = create_map(BPF_MAP_TYPE_ARRAY, sizeof(uint32_t), sizeof(uint32_t), 1, 0);
-    if (*fd_out < 0) {
-        fprintf(stderr, "create runtime config map failed: errno=%d (%s)\n", errno, strerror(errno));
-        return STATUS_CONFIG_ERROR;
-    }
-
-    uint32_t key = 0;
-    uint32_t value = config->cidr_hit_is_match ? 1U : 0U;
-    if (update_elem(*fd_out, &key, &value) != 0) {
-        fprintf(stderr, "write runtime config map failed: errno=%d (%s)\n", errno, strerror(errno));
-        return STATUS_CONFIG_ERROR;
-    }
-
-    return pin_replace(*fd_out, config->map_runtime) == 0 ? STATUS_OK : STATUS_CONFIG_ERROR;
-}
-
 static int create_cidr_map(const char *source, const char *pin_path, bool ipv6, int *fd_out) {
     *fd_out = create_map(
         BPF_MAP_TYPE_LPM_TRIE,
@@ -115,7 +101,7 @@ static int create_uid_map(const char *source, const char *pin_path, bool require
 }
 
 static int pin_program(const char *section, const char *name, const char *pin_path, const struct fds *fds) {
-    int fd = load_program(section, name, fds->runtime, fds->cidr4, fds->cidr6, fds->force_uid, fds->app_uid);
+    int fd = load_program(section, name, fds->cidr4, fds->cidr6, fds->force_uid, fds->app_uid);
     if (fd < 0) return STATUS_CONFIG_ERROR;
 
     int rc = pin_replace(fd, pin_path);
@@ -131,7 +117,6 @@ static int apply_config(const struct config *config) {
     init_fds(&fds);
 
     bool app_uid_required = uid_file_has_entries(config->app_uid_file);
-    if (create_runtime_map(config, &fds.runtime) != STATUS_OK) goto cleanup;
     if (create_cidr_map(config->cidr4_file, config->map_cidr4, false, &fds.cidr4) != STATUS_OK) goto cleanup;
     if (create_cidr_map(config->cidr6_file, config->map_cidr6, true, &fds.cidr6) != STATUS_OK) goto cleanup;
     if (create_uid_map(config->force_uid_file, config->map_force_uid, false, &fds.force_uid) != STATUS_OK) goto cleanup;
@@ -158,14 +143,12 @@ cleanup:
 }
 
 static int update_config(const struct config *config) {
-    int runtime = get_pinned(config->map_runtime);
     int cidr4 = get_pinned(config->map_cidr4);
     int cidr6 = get_pinned(config->map_cidr6);
     int force_uid = get_pinned(config->map_force_uid);
     int app_uid = get_pinned(config->map_app_uid);
 
-    if (runtime < 0 || cidr4 < 0 || (config->ipv6 && cidr6 < 0) || force_uid < 0 || app_uid < 0) {
-        close_fd(runtime);
+    if (cidr4 < 0 || (config->ipv6 && cidr6 < 0) || force_uid < 0 || app_uid < 0) {
         close_fd(cidr4);
         close_fd(cidr6);
         close_fd(force_uid);
@@ -174,10 +157,6 @@ static int update_config(const struct config *config) {
     }
 
     int status = STATUS_OK;
-    uint32_t runtime_key = 0;
-    uint32_t runtime_value = config->cidr_hit_is_match ? 1U : 0U;
-    if (update_elem(runtime, &runtime_key, &runtime_value) != 0) status = STATUS_UPDATE_ERROR;
-
     if (clear_map(cidr4, sizeof(struct lpm4_key)) < 0) status = STATUS_UPDATE_ERROR;
     load_cidr_file(cidr4, config->cidr4_file, false);
     if (config->ipv6) {
@@ -189,7 +168,6 @@ static int update_config(const struct config *config) {
     if (clear_map(app_uid, sizeof(uint32_t)) < 0) status = STATUS_UPDATE_ERROR;
     load_uid_file(app_uid, config->app_uid_file);
 
-    close_fd(runtime);
     close_fd(cidr4);
     close_fd(cidr6);
     close_fd(force_uid);
@@ -206,7 +184,6 @@ static int run_with_config(const char *config_path, bool update_only) {
 static int probe_runtime(bool ipv6) {
     struct config config;
     config_defaults(&config);
-    snprintf(config.map_runtime, sizeof(config.map_runtime), "%s", PROBE_MAP_RUNTIME);
     snprintf(config.map_cidr4, sizeof(config.map_cidr4), "%s", PROBE_MAP_CIDR4);
     snprintf(config.map_cidr6, sizeof(config.map_cidr6), "%s", PROBE_MAP_CIDR6);
     snprintf(config.map_force_uid, sizeof(config.map_force_uid), "%s", PROBE_MAP_FORCE_UID);
@@ -216,7 +193,6 @@ static int probe_runtime(bool ipv6) {
     init_fds(&fds);
     bool ok = false;
 
-    if (create_runtime_map(&config, &fds.runtime) != STATUS_OK) goto cleanup;
     if (create_cidr_map("/dev/null", config.map_cidr4, false, &fds.cidr4) != STATUS_OK) goto cleanup;
     if (create_cidr_map("/dev/null", config.map_cidr6, true, &fds.cidr6) != STATUS_OK) goto cleanup;
     if (create_uid_map("", config.map_force_uid, false, &fds.force_uid) != STATUS_OK) goto cleanup;
@@ -231,7 +207,6 @@ cleanup:
     close_fds(&fds);
     unlink(PROBE_PIN4);
     unlink(PROBE_PIN6);
-    unlink(config.map_runtime);
     unlink(config.map_cidr4);
     unlink(config.map_cidr6);
     unlink(config.map_force_uid);
@@ -252,6 +227,8 @@ cleanup:
 }
 
 int main(int argc, char **argv) {
+    raise_memlock();
+
     if (has_arg(argc, argv, "--clear")) {
         remove_known_pins();
         return STATUS_OK;

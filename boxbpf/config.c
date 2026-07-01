@@ -11,7 +11,6 @@
 void config_defaults(struct config *config) {
     memset(config, 0, sizeof(*config));
     config->ipv6 = true;
-    config->cidr_hit_is_match = true;
 
     snprintf(config->pin_cidr_out4, sizeof(config->pin_cidr_out4), "%s", PIN_CIDR_OUT4);
     snprintf(config->pin_cidr_out6, sizeof(config->pin_cidr_out6), "%s", PIN_CIDR_OUT6);
@@ -22,7 +21,6 @@ void config_defaults(struct config *config) {
     snprintf(config->pin_app_out4, sizeof(config->pin_app_out4), "%s", PIN_APP_OUT4);
     snprintf(config->pin_app_out6, sizeof(config->pin_app_out6), "%s", PIN_APP_OUT6);
 
-    snprintf(config->map_runtime, sizeof(config->map_runtime), "%s", MAP_RUNTIME);
     snprintf(config->map_cidr4, sizeof(config->map_cidr4), "%s", MAP_CIDR4);
     snprintf(config->map_cidr6, sizeof(config->map_cidr6), "%s", MAP_CIDR6);
     snprintf(config->map_force_uid, sizeof(config->map_force_uid), "%s", MAP_FORCE_UID);
@@ -113,7 +111,6 @@ bool read_config_json(const char *path, struct config *config) {
     }
 
     read_json_bool(json, "ipv6", &config->ipv6);
-    read_json_bool(json, "cidrHitIsMatch", &config->cidr_hit_is_match);
     read_json_string(json, "cidr4", config->cidr4_file, sizeof(config->cidr4_file));
     read_json_string(json, "cidr6", config->cidr6_file, sizeof(config->cidr6_file));
     read_json_string(json, "forceUids", config->force_uid_file, sizeof(config->force_uid_file));
@@ -128,7 +125,6 @@ bool read_config_json(const char *path, struct config *config) {
     read_json_string(json, "pinAppOut4", config->pin_app_out4, sizeof(config->pin_app_out4));
     read_json_string(json, "pinAppOut6", config->pin_app_out6, sizeof(config->pin_app_out6));
 
-    read_json_string(json, "mapRuntime", config->map_runtime, sizeof(config->map_runtime));
     read_json_string(json, "mapCidr4", config->map_cidr4, sizeof(config->map_cidr4));
     read_json_string(json, "mapCidr6", config->map_cidr6, sizeof(config->map_cidr6));
     read_json_string(json, "mapForceUid", config->map_force_uid, sizeof(config->map_force_uid));

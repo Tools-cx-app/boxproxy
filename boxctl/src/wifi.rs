@@ -80,11 +80,6 @@ pub fn apply(config: &Config, runner: &Runner) -> Result<()> {
     Ok(())
 }
 
-pub fn record_current_wifi_state(config: &Config, runner: &Runner) {
-    let observation = current_observation(runner);
-    save_wifi_state(config, &observation);
-}
-
 pub fn monitor(config: &Config, runner: &Runner) -> Result<()> {
     if monitor_worker_requested() {
         return if monitor_required(config, runner) {

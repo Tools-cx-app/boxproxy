@@ -316,40 +316,22 @@ static int load_with_read_fallback(
 
 static int build_cidr_matcher(
     int cidr_map_fd,
-    int runtime_map_fd,
+    int unused_fd,
     const struct packet_layout *l,
     const char *name,
     enum read_mode mode,
     bool log_error
 ) {
+    (void)unused_fd;
     struct prog_builder b = {0};
     emit(&b, INSN_MOV64_REG(BPF_REG_6, BPF_REG_1));
 
     size_t load_fail = emit_load_destination(&b, l, mode);
     emit_cidr_lookup(&b, cidr_map_fd, l);
+    size_t cidr_miss = emit_jump(&b, INSN_JMP_IMM(BPF_JEQ, BPF_REG_0, 0, 0));
 
-    emit(&b, INSN_MOV64_IMM(BPF_REG_7, 0));
-    size_t hit_is_zero = emit_jump(&b, INSN_JMP_IMM(BPF_JEQ, BPF_REG_0, 0, 0));
-    emit(&b, INSN_MOV64_IMM(BPF_REG_7, 1));
-    patch_jump_here(&b, hit_is_zero);
-
-    emit(&b, INSN_ST_MEM(BPF_W, BPF_REG_10, l->scratch_stack_off, 0));
-    emit_map_fd(&b, BPF_REG_1, runtime_map_fd);
-    emit(&b, INSN_MOV64_REG(BPF_REG_2, BPF_REG_10));
-    emit(&b, INSN_ALU64_IMM(BPF_ADD, BPF_REG_2, l->scratch_stack_off));
-    emit(&b, INSN_CALL(BPF_FUNC_map_lookup_elem));
-    emit(&b, INSN_MOV64_IMM(BPF_REG_8, 1));
-    size_t config_absent = emit_jump(&b, INSN_JMP_IMM(BPF_JEQ, BPF_REG_0, 0, 0));
-    emit(&b, INSN_LDX_MEM(BPF_W, BPF_REG_8, BPF_REG_0, 0));
-    patch_jump_here(&b, config_absent);
-
-    size_t keep_direction = emit_jump(&b, INSN_JMP_IMM(BPF_JNE, BPF_REG_8, 0, 0));
-    emit(&b, INSN_ALU64_IMM(BPF_XOR, BPF_REG_7, 1));
-    patch_jump_here(&b, keep_direction);
-
-    size_t result_miss = emit_jump(&b, INSN_JMP_IMM(BPF_JEQ, BPF_REG_7, 0, 0));
     emit_result(&b, XT_BPF_MATCH);
-    patch_jump_here(&b, result_miss);
+    patch_jump_here(&b, cidr_miss);
     if (load_fail != NO_JUMP) {
         patch_jump_here(&b, load_fail);
     }
@@ -358,8 +340,8 @@ static int build_cidr_matcher(
     return load_socket_filter(&b, name, log_error);
 }
 
-static int load_cidr_matcher(int cidr_map_fd, int runtime_map_fd, const struct packet_layout *l, const char *name) {
-    return load_with_read_fallback(build_cidr_matcher, cidr_map_fd, runtime_map_fd, l, name);
+static int load_cidr_matcher(int cidr_map_fd, const struct packet_layout *l, const char *name) {
+    return load_with_read_fallback(build_cidr_matcher, cidr_map_fd, -1, l, name);
 }
 
 static int build_force_matcher(
@@ -422,17 +404,16 @@ static int load_uid_matcher(int uid_map_fd, const char *name) {
 int load_program(
     const char *section_name,
     const char *program_name,
-    int runtime_fd,
     int cidr4_fd,
     int cidr6_fd,
     int force_uid_fd,
     int app_uid_fd
 ) {
     if (strcmp(section_name, "socket/cidr4") == 0) {
-        return load_cidr_matcher(cidr4_fd, runtime_fd, &LAYOUT_V4, program_name);
+        return load_cidr_matcher(cidr4_fd, &LAYOUT_V4, program_name);
     }
     if (strcmp(section_name, "socket/cidr6") == 0) {
-        return load_cidr_matcher(cidr6_fd, runtime_fd, &LAYOUT_V6, program_name);
+        return load_cidr_matcher(cidr6_fd, &LAYOUT_V6, program_name);
     }
     if (strcmp(section_name, "socket/force4") == 0) {
         return load_force_matcher(cidr4_fd, force_uid_fd, &LAYOUT_V4, program_name);
