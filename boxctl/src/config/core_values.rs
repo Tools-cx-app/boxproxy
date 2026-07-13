@@ -34,14 +34,13 @@ impl CoreConfigValues {
     }
 
     fn read_mihomo(text: &str, network_mode: &str) -> Self {
-        let values: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+        let values: serde_yaml::Value = serde_yaml::from_str(text).unwrap();
         Self {
             read_status: "read mihomo config".to_string(),
             mihomo_dns_port: values.get("dns").unwrap().get("listen").and_then(|v| {
                 v.as_str()
                     .unwrap()
-                    .split_once(':')
-                    .and_then(|v| Some(v.1.to_string()))
+                    .split_once(':').map(|v| v.1.to_string())
             }),
             tun_device: if matches!(network_mode, "tun" | "mixed") {
                 values.get("tun").and_then(|v| {
@@ -54,19 +53,17 @@ impl CoreConfigValues {
             fake_ip_range: values
                 .get("dns")
                 .unwrap()
-                .get("fake-ip-range")
-                .and_then(|v| Some(v.as_str().unwrap().to_string())),
+                .get("fake-ip-range").map(|v| v.as_str().unwrap().to_string()),
             fake_ip6_range: values
                 .get("dns")
                 .unwrap()
-                .get("fake-ip-range6")
-                .and_then(|v| Some(v.as_str().unwrap().to_string())),
+                .get("fake-ip-range6").map(|v| v.as_str().unwrap().to_string()),
         }
     }
 
     fn read_sing_box(text: &str, network_mode: &str) -> Self {
         let values: serde_json::Value =
-            jsonc_parser::parse_to_serde_value(&text, &ParseOptions::default()).unwrap();
+            jsonc_parser::parse_to_serde_value(text, &ParseOptions::default()).unwrap();
         Self {
             read_status: "read sing-box config".to_string(),
             mihomo_dns_port: None,
@@ -79,11 +76,8 @@ impl CoreConfigValues {
                     .iter()
                     .find(|v| v.get("interface_name").is_some())
                     .and_then(|v| {
-                        v.get("interface_name")
-                            .and_then(|v| Some(v.as_str().unwrap().to_string()))
+                        v.get("interface_name").map(|v| v.as_str().unwrap().to_string())
                     })
-
-                // json_string_value(text, "interface_name").filter(|value| !value.is_empty())
             } else {
                 None
             },
@@ -97,8 +91,7 @@ impl CoreConfigValues {
                 .iter()
                 .find(|v| v.get("inet4_range").is_some())
                 .and_then(|v| {
-                    v.get("inet4_range")
-                        .and_then(|v| Some(v.as_str().unwrap().to_string()))
+                    v.get("inet4_range").map(|v| v.as_str().unwrap().to_string())
                 }),
             fake_ip6_range: values
                 .get("dns")
@@ -110,8 +103,7 @@ impl CoreConfigValues {
                 .iter()
                 .find(|v| v.get("inet6_range").is_some())
                 .and_then(|v| {
-                    v.get("inet6_range")
-                        .and_then(|v| Some(v.as_str().unwrap().to_string()))
+                    v.get("inet6_range").map(|v| v.as_str().unwrap().to_string())
                 }),
         }
     }
