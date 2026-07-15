@@ -3,7 +3,7 @@ use super::*;
 pub(super) fn core_check_command(config: &Config) -> (String, Vec<String>) {
     let bin = config.bin_path.to_string_lossy().to_string();
     let dir = config.core_dir().to_string_lossy().to_string();
-    let file = config.config_path().to_string_lossy().to_string();
+    let file = config.launch_config_path().to_string_lossy().to_string();
 
     match config.bin_name.as_str() {
         "mihomo" => (bin, vec!["-t".into(), "-d".into(), dir, "-f".into(), file]),
@@ -21,7 +21,7 @@ pub(super) fn core_check_command(config: &Config) -> (String, Vec<String>) {
 pub(super) fn core_run_command(config: &Config) -> (String, Vec<String>) {
     let mut args = Vec::new();
     let dir = config.core_dir().to_string_lossy().to_string();
-    let file = config.config_path().to_string_lossy().to_string();
+    let file = config.launch_config_path().to_string_lossy().to_string();
     let bin = config.bin_path.to_string_lossy().to_string();
 
     match config.bin_name.as_str() {
@@ -79,7 +79,9 @@ fn taskset_mask_arg(config: &Config) -> Result<String> {
     } else {
         config.allow_cpu.trim().to_string()
     };
-    cpu_list_to_taskset_mask(&cores)
+    let requested = cpu_list_to_mask(&cores)?;
+    let effective = constrain_to_available_cpus(requested, &cores)?;
+    Ok(format!("{effective:x}"))
 }
 
 fn detect_cpu_range() -> Option<String> {
@@ -91,7 +93,7 @@ fn detect_cpu_range() -> Option<String> {
     }
 }
 
-fn cpu_list_to_taskset_mask(list: &str) -> Result<String> {
+fn cpu_list_to_mask(list: &str) -> Result<u128> {
     let mut mask = 0_u128;
     let mut any = false;
 
@@ -124,7 +126,7 @@ fn cpu_list_to_taskset_mask(list: &str) -> Result<String> {
     if !any {
         return Err("empty CPU list".to_string());
     }
-    Ok(format!("{mask:x}"))
+    Ok(mask)
 }
 
 fn parse_cpu_index(value: &str) -> Result<u32> {
@@ -135,4 +137,43 @@ fn parse_cpu_index(value: &str) -> Result<u32> {
     value
         .parse::<u32>()
         .map_err(|_| format!("invalid CPU index: {value}"))
+}
+
+fn constrain_to_available_cpus(requested: u128, cores: &str) -> Result<u128> {
+    let Some(available) = available_cpu_mask() else {
+        return Ok(requested);
+    };
+    let effective = requested & available;
+    if effective == 0 {
+        return Err(format!(
+            "requested CPU cores {cores} are outside available CPU mask {available:x}"
+        ));
+    }
+    if effective != requested {
+        eprintln!(
+            "[core_run_command] taskset mask adjusted from {requested:x} to {effective:x}, available {available:x}"
+        );
+    }
+    Ok(effective)
+}
+
+fn available_cpu_mask() -> Option<u128> {
+    [online_cpu_mask(), allowed_cpu_mask()]
+        .into_iter()
+        .flatten()
+        .reduce(|left, right| left & right)
+}
+
+fn online_cpu_mask() -> Option<u128> {
+    std::fs::read_to_string("/sys/devices/system/cpu/online")
+        .ok()
+        .and_then(|text| cpu_list_to_mask(text.trim()).ok())
+}
+
+fn allowed_cpu_mask() -> Option<u128> {
+    let text = std::fs::read_to_string("/proc/self/status").ok()?;
+    text.lines().find_map(|line| {
+        line.strip_prefix("Cpus_allowed_list:")
+            .and_then(|value| cpu_list_to_mask(value.trim()).ok())
+    })
 }

@@ -43,39 +43,74 @@ pub(super) fn monitor_required(config: &Config, runner: &Runner) -> bool {
 
 pub(super) fn monitor_worker_running(config: &Config) -> bool {
     let path = monitor_lock_path(config);
-    if let Some(pid) = read_monitor_pid(&path) {
-        if monitor_pid_matches(pid) {
+    if let Some(identity) = read_monitor_identity(&path) {
+        if monitor_identity_matches(&identity) {
             return true;
         }
-        let _ = fs::remove_file(path);
     }
+
+    if monitor_lock_is_held(&path) {
+        return true;
+    }
+    let _ = fs::remove_file(path);
     false
 }
 
 pub(super) fn stop_monitor_worker(config: &Config, runner: &Runner) -> Result<()> {
     let path = monitor_lock_path(config);
-    let Some(pid) = read_monitor_pid(&path) else {
+    let Some(identity) = read_monitor_identity(&path) else {
+        if monitor_lock_is_held(&path) {
+            return Err("monitor lock identity is missing or invalid; refusing to signal an unverified process".to_string());
+        }
+        let _ = fs::remove_file(path);
         return Ok(());
     };
 
-    if !monitor_pid_matches(pid) {
+    if !monitor_identity_matches(&identity) {
+        if monitor_lock_is_held(&path) {
+            return Err(
+                "monitor identity cannot be verified; refusing to signal an unverified process"
+                    .to_string(),
+            );
+        }
         let _ = fs::remove_file(path);
         return Ok(());
     }
 
     logger::info_key(config, LogKey::WifiMonitorStopped, &[]);
-    signal_monitor_process_group(runner, pid, SIGTERM);
+    signal_monitor_process_group(runner, identity.pid, SIGTERM);
     for _ in 0..20 {
-        if !monitor_pid_matches(pid) {
+        if !monitor_identity_matches(&identity) {
+            if monitor_lock_is_held(&path) {
+                return Err(
+                    "monitor identity cannot be verified after SIGTERM; refusing SIGKILL"
+                        .to_string(),
+                );
+            }
             let _ = fs::remove_file(&path);
             return Ok(());
         }
         thread::sleep(Duration::from_millis(100));
     }
 
-    signal_monitor_process_group(runner, pid, SIGKILL);
-    let _ = fs::remove_file(path);
-    Ok(())
+    if !monitor_identity_matches(&identity) {
+        return Err("monitor identity changed before SIGKILL; refusing to signal it".to_string());
+    }
+    signal_monitor_process_group(runner, identity.pid, SIGKILL);
+    for _ in 0..10 {
+        if !monitor_identity_matches(&identity) {
+            if monitor_lock_is_held(&path) {
+                return Err(
+                    "monitor identity cannot be verified after SIGKILL; retaining lock".to_string(),
+                );
+            }
+            let _ = fs::remove_file(&path);
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    Err("monitor remains alive after SIGKILL; retaining lock".to_string())
 }
 
 fn signal_monitor_process_group(runner: &Runner, pid: u32, sig: i32) {
@@ -96,12 +131,14 @@ fn signal_monitor_process_group(runner: &Runner, pid: u32, sig: i32) {
 
 pub(super) fn spawn_monitor_worker(config: &Config) -> Result<()> {
     let exe = env::current_exe().unwrap_or_else(|_| config.paths.bin.join("boxctl"));
+    let token = generate_monitor_token()?;
     let mut command = Command::new(exe);
     command
         .arg("--db")
         .arg(config.paths.db.as_os_str())
         .arg("monitor")
         .env(MONITOR_WORKER_ENV, "1")
+        .env(MONITOR_TOKEN_ENV, token)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());

@@ -44,8 +44,6 @@ impl<'a> RuleManager<'a> {
 
         let macs = valid_macs(&self.config.macs_list);
 
-        // The whitelist-empty condition is interface-independent, so report it
-        // once for all hotspot interfaces instead of one warning per interface.
         if self.config.mac_mode == "whitelist" && macs.is_empty() && family == Family::V4 {
             logger::warn_key(
                 self.config,

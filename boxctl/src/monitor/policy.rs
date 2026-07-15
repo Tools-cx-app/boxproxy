@@ -1,4 +1,5 @@
 use super::*;
+use crate::control;
 
 pub(super) fn apply_network_control_policy(
     config: &Config,
@@ -79,33 +80,21 @@ pub(super) fn refresh_connected_ip(runner: &Runner, observation: &mut WifiObserv
 }
 
 pub(super) fn run_ip_monitor_once(config: &Config, runner: &Runner) -> Result<()> {
-    let mut child = Command::new("ip")
-        .args(["monitor", "link", "address", "route"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|err| format!("start ip monitor failed: {err}"))?;
-
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "cannot read ip monitor output".to_string())?;
-    let (tx, rx) = mpsc::channel::<()>();
+    let mut socket = open_route_event_socket()?;
+    let (tx, rx) = mpsc::channel::<Result<()>>();
     let reader_handle = thread::spawn(move || {
-        let mut reader = BufReader::new(stdout);
-        let mut line = String::new();
+        let mut buffer = [0_u8; 32 * 1024];
         loop {
-            line.clear();
-            let read = match reader.read_line(&mut line) {
-                Ok(read) => read,
-                Err(_) => break,
-            };
-            if read == 0 {
-                break;
-            }
-            if !line.trim().is_empty() && tx.send(()).is_err() {
-                break;
+            match wait_for_route_event(&mut socket, &mut buffer) {
+                Ok(()) => {
+                    if tx.send(Ok(())).is_err() {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    let _ = tx.send(Err(err));
+                    break;
+                }
             }
         }
     });
@@ -115,20 +104,14 @@ pub(super) fn run_ip_monitor_once(config: &Config, runner: &Runner) -> Result<()
 
     reconcile_network_state(config, runner, &mut live, &mut iface_cache);
 
-    while rx.recv().is_ok() {
-        wait_for_network_event_quiet(&rx);
+    while let Ok(event) = rx.recv() {
+        event?;
+        wait_for_network_event_quiet(&rx)?;
         reconcile_network_state(config, runner, &mut live, &mut iface_cache);
     }
 
-    let _ = child.kill();
-    let status = child
-        .wait()
-        .map_err(|err| format!("wait for ip monitor exit failed: {err}"))?;
     let _ = reader_handle.join();
-    if !status.success() {
-        return Err(format!("ip monitor exited: {status}"));
-    }
-    Ok(())
+    Err("route netlink event stream ended".to_string())
 }
 
 fn reconcile_network_state(
@@ -147,46 +130,92 @@ fn reconcile_network_state(
     }
 }
 
-const LIVE_CONFIG_TTL: Duration = Duration::from_secs(5);
+const LIVE_CONFIG_RECHECK_INTERVAL: Duration = Duration::from_secs(1);
 
 struct LiveConfigCache {
     cached: Option<Config>,
-    loaded_at: Option<Instant>,
+    revision: Option<RuntimeConfigRevision>,
+    checked_at: Option<Instant>,
 }
 
 impl LiveConfigCache {
     fn new() -> Self {
         Self {
             cached: None,
-            loaded_at: None,
+            revision: None,
+            checked_at: None,
         }
     }
 
     fn get(&mut self, base: &Config) -> &Config {
-        let fresh = self
-            .loaded_at
-            .map(|at| at.elapsed() < LIVE_CONFIG_TTL)
-            .unwrap_or(false);
-        if !fresh {
-            self.cached = Some(load_live_config(base));
-            self.loaded_at = Some(Instant::now());
+        let should_check = self.cached.is_none()
+            || self
+                .checked_at
+                .map(|at| at.elapsed() >= LIVE_CONFIG_RECHECK_INTERVAL)
+                .unwrap_or(true);
+        if should_check {
+            let revision = runtime_config_revision(&base.paths.db);
+            if self.cached.is_none() {
+                self.cached = Some(base.clone());
+            } else if self.revision.as_ref() != Some(&revision) {
+                self.cached = Some(load_live_config(base));
+            }
+            self.revision = Some(revision);
+            self.checked_at = Some(Instant::now());
         }
         self.cached.as_ref().unwrap()
     }
 }
 
-pub(super) fn wait_for_network_event_quiet(rx: &mpsc::Receiver<()>) {
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RuntimeConfigRevision {
+    database: FileRevision,
+    wal: FileRevision,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FileRevision {
+    modified: Option<std::time::SystemTime>,
+    len: Option<u64>,
+}
+
+fn runtime_config_revision(path: &std::path::Path) -> RuntimeConfigRevision {
+    RuntimeConfigRevision {
+        database: file_revision(path),
+        wal: file_revision(&sqlite_sidecar_path(path, "-wal")),
+    }
+}
+
+fn file_revision(path: &std::path::Path) -> FileRevision {
+    let metadata = fs::metadata(path).ok();
+    FileRevision {
+        modified: metadata
+            .as_ref()
+            .and_then(|metadata| metadata.modified().ok()),
+        len: metadata.as_ref().map(|metadata| metadata.len()),
+    }
+}
+
+fn sqlite_sidecar_path(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    value.into()
+}
+
+pub(super) fn wait_for_network_event_quiet(rx: &mpsc::Receiver<Result<()>>) -> Result<()> {
     let started = Instant::now();
     let quiet = Duration::from_millis(WIFI_EVENT_DEBOUNCE_MS);
     let max_wait = Duration::from_millis(WIFI_EVENT_MAX_DEBOUNCE_MS);
     loop {
         match rx.recv_timeout(quiet) {
-            Ok(()) if started.elapsed() < max_wait => continue,
-            Ok(()) => break,
+            Ok(Ok(())) if started.elapsed() < max_wait => continue,
+            Ok(Ok(())) => break,
+            Ok(Err(err)) => return Err(err),
             Err(mpsc::RecvTimeoutError::Timeout) => break,
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
+    Ok(())
 }
 
 pub(super) fn start_service_if_needed(config: &Config, runner: &Runner) -> Result<ServiceAction> {
@@ -194,7 +223,7 @@ pub(super) fn start_service_if_needed(config: &Config, runner: &Runner) -> Resul
         return Ok(ServiceAction::AlreadyRunning);
     }
 
-    run_boxctl_service_command(config, "up")?;
+    control::up_from_monitor(config, runner)?;
     Ok(ServiceAction::Started)
 }
 
@@ -203,28 +232,8 @@ pub(super) fn stop_service_if_needed(config: &Config, runner: &Runner) -> Result
         return Ok(ServiceAction::AlreadyStopped);
     }
 
-    run_boxctl_service_command(config, "down")?;
+    control::down_from_monitor(config, runner)?;
     Ok(ServiceAction::Stopped)
-}
-
-fn run_boxctl_service_command(config: &Config, action: &str) -> Result<()> {
-    let exe = env::current_exe().unwrap_or_else(|_| config.paths.bin.join("boxctl"));
-    let status = Command::new(&exe)
-        .arg("--db")
-        .arg(config.paths.db.as_os_str())
-        .arg(action)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|err| format!("execute {} {action} failed: {err}", exe.display()))?;
-    if !status.success() {
-        return Err(format!(
-            "execute {} {action} exited: {status}",
-            exe.display()
-        ));
-    }
-    Ok(())
 }
 
 pub(super) fn refresh_local_ip_rules_if_running(config: &Config, runner: &Runner) -> Result<()> {

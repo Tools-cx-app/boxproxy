@@ -74,32 +74,20 @@ pub fn load_runtime_data(db_path: &Path) -> Result<RuntimeData> {
         .filter(|value| value.chars().all(|ch| ch.is_ascii_digit()))
         .collect();
     profile.cnip_force_uids = read_uid_list(&conn, "cnip_force_uids", "uid");
-    profile.wifi_network_control_enabled = read_wifi_flag(
-        &conn,
-        "wifi_match_settings",
-        "network_control_enabled",
-        false,
-    )?;
-    profile.wifi_use_on_disconnect =
-        read_wifi_flag(&conn, "wifi_match_settings", "use_on_wifi_disconnect", true)?;
-    profile.wifi_use_on_connect =
-        read_wifi_flag(&conn, "wifi_match_settings", "use_on_wifi_connect", true)?;
-    profile.wifi_enable_ssid_matching =
-        read_wifi_flag(&conn, "wifi_match_settings", "enable_ssid_matching", false)?;
-    profile.wifi_enable_log = read_wifi_flag(
-        &conn,
-        "wifi_match_settings",
-        "enable_network_control_log",
-        true,
-    )?;
-    profile.wifi_list_mode =
-        read_wifi_text(&conn, "wifi_match_settings", "list_mode", "blacklist")?;
+    let wifi_settings = read_wifi_settings(&conn)?;
+    profile.wifi_network_control_enabled = wifi_settings.network_control_enabled;
+    profile.wifi_use_on_disconnect = wifi_settings.use_on_wifi_disconnect;
+    profile.wifi_use_on_connect = wifi_settings.use_on_wifi_connect;
+    profile.wifi_enable_ssid_matching = wifi_settings.enable_ssid_matching;
+    profile.wifi_enable_log = wifi_settings.enable_network_control_log;
+    profile.wifi_list_mode = wifi_settings.list_mode;
     profile.wifi_ssids = read_string_list(&conn, "wifi_match_ssids", "value")?;
     profile.wifi_bssids = read_string_list(&conn, "wifi_match_bssids", "value")?;
     profile.hotspot_ap_interfaces = read_string_list(&conn, "hotspot_ap_interfaces", "value")?;
     profile.blocked_interfaces = read_string_list(&conn, "blocked_interfaces", "value")?;
-    profile.mac_filter = read_wifi_flag(&conn, "hotspot_settings", "mac_filter", false)?;
-    profile.mac_mode = read_wifi_text(&conn, "hotspot_settings", "mac_mode", "blacklist")?;
+    let hotspot_settings = read_hotspot_settings(&conn)?;
+    profile.mac_filter = hotspot_settings.mac_filter;
+    profile.mac_mode = hotspot_settings.mac_mode;
     profile.macs_list = read_string_list(&conn, "hotspot_macs", "value")?;
     profile.intranet_cidrs4 = read_string_list(&conn, "intranet_ipv4_cidrs", "value")?;
     profile.intranet_cidrs6 = read_string_list(&conn, "intranet_ipv6_cidrs", "value")?;

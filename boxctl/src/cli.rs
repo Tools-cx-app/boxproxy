@@ -411,7 +411,7 @@ pub(crate) fn parse_args(args: Vec<String>) -> Result<Cli> {
 
 impl RawCli {
     fn into_cli(self) -> Result<Cli> {
-        let mut overrides = self.options.into_overrides();
+        let mut overrides = self.options.to_overrides();
         let command = self.command.into_command(&mut overrides)?;
         Ok(Cli {
             home: self.options.home,
@@ -424,21 +424,55 @@ impl RawCli {
 }
 
 impl RawOptions {
-    fn into_overrides(&self) -> ConfigOverrides {
-        let mut overrides = ConfigOverrides::default();
-        overrides.db_path = self.db_path.clone();
-        overrides.bin_name = self.bin_name.clone();
-        overrides.bin_path = self.bin_path.clone();
-        overrides.config_path = self.config_path.clone();
-        overrides.network_mode = self.mode.map(|mode| mode.as_str().to_string());
-        overrides.proxy_mode = self.proxy_mode.clone();
-        overrides.tproxy_port = self.tproxy_port.clone();
-        overrides.redir_port = self.redir_port.clone();
-        overrides.tun_device = self.tun_device.clone();
-        overrides.dns_hijack_mode = self.dns_mode.clone();
-        overrides.mihomo_dns_port = self.dns_port.clone();
-        overrides.mihomo_dns_forward = self.dns_forward.clone();
-        overrides.ipv6_mode = self.ipv6_mode.map(|mode| mode.as_str().to_string());
+    fn to_overrides(&self) -> ConfigOverrides {
+        let mut bypass_cn_ip = None;
+        let mut bypass_cn_ip_v4 = None;
+        let mut bypass_cn_ip_v6 = None;
+        if self.bypass_cn {
+            bypass_cn_ip = Some(true);
+            bypass_cn_ip_v4 = Some(true);
+            bypass_cn_ip_v6 = Some(true);
+        }
+        if self.no_bypass_cn {
+            bypass_cn_ip = Some(false);
+            bypass_cn_ip_v4 = Some(false);
+            bypass_cn_ip_v6 = Some(false);
+        }
+        if self.bypass_cn_v4 {
+            bypass_cn_ip = Some(true);
+            bypass_cn_ip_v4 = Some(true);
+        }
+        if self.bypass_cn_v6 {
+            bypass_cn_ip = Some(true);
+            bypass_cn_ip_v6 = Some(true);
+        }
+
+        let mut overrides = ConfigOverrides {
+            db_path: self.db_path.clone(),
+            bin_name: self.bin_name.clone(),
+            bin_path: self.bin_path.clone(),
+            config_path: self.config_path.clone(),
+            network_mode: self.mode.map(|mode| mode.as_str().to_string()),
+            proxy_mode: self.proxy_mode.clone(),
+            tproxy_port: self.tproxy_port.clone(),
+            redir_port: self.redir_port.clone(),
+            tun_device: self.tun_device.clone(),
+            dns_hijack_mode: self.dns_mode.clone(),
+            mihomo_dns_port: self.dns_port.clone(),
+            mihomo_dns_forward: self.dns_forward.clone(),
+            ipv6_mode: self.ipv6_mode.map(|mode| mode.as_str().to_string()),
+            memcg_limit: self.memcg_limit.clone(),
+            allow_cpu: self.allow_cpu.clone(),
+            weight: self.weight.clone(),
+            bypass_cn_ip,
+            bypass_cn_ip_v4,
+            bypass_cn_ip_v6,
+            cn_ip_file: self.cn_ip_file.clone(),
+            cn_ipv6_file: self.cn_ipv6_file.clone(),
+            fake_ip_range: self.fake_ip_range.clone(),
+            fake_ip6_range: self.fake_ip6_range.clone(),
+            ..ConfigOverrides::default()
+        };
         set_flag(&mut overrides.ipv6_mode, self.ipv6, "enable");
         set_flag(&mut overrides.ipv6_mode, self.no_ipv6, "bypass");
         set_bool(&mut overrides.proxy_tcp, self.tcp, true);
@@ -453,35 +487,10 @@ impl RawOptions {
         set_flag(&mut overrides.quic, self.no_quic, "disable");
         set_bool(&mut overrides.cgroup_memcg, self.memcg, true);
         set_bool(&mut overrides.cgroup_memcg, self.no_memcg, false);
-        overrides.memcg_limit = self.memcg_limit.clone();
         set_bool(&mut overrides.taskset_cpu, self.taskset, true);
         set_bool(&mut overrides.taskset_cpu, self.no_taskset, false);
-        overrides.allow_cpu = self.allow_cpu.clone();
         set_bool(&mut overrides.cgroup_blkio, self.blkio, true);
         set_bool(&mut overrides.cgroup_blkio, self.no_blkio, false);
-        overrides.weight = self.weight.clone();
-        if self.bypass_cn {
-            overrides.bypass_cn_ip = Some(true);
-            overrides.bypass_cn_ip_v4 = Some(true);
-            overrides.bypass_cn_ip_v6 = Some(true);
-        }
-        if self.no_bypass_cn {
-            overrides.bypass_cn_ip = Some(false);
-            overrides.bypass_cn_ip_v4 = Some(false);
-            overrides.bypass_cn_ip_v6 = Some(false);
-        }
-        if self.bypass_cn_v4 {
-            overrides.bypass_cn_ip = Some(true);
-            overrides.bypass_cn_ip_v4 = Some(true);
-        }
-        if self.bypass_cn_v6 {
-            overrides.bypass_cn_ip = Some(true);
-            overrides.bypass_cn_ip_v6 = Some(true);
-        }
-        overrides.cn_ip_file = self.cn_ip_file.clone();
-        overrides.cn_ipv6_file = self.cn_ipv6_file.clone();
-        overrides.fake_ip_range = self.fake_ip_range.clone();
-        overrides.fake_ip6_range = self.fake_ip6_range.clone();
         overrides
     }
 }

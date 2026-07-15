@@ -46,7 +46,7 @@ fn start_inner(config: &Config, runner: &Runner) -> Result<()> {
         &[
             arg("core", &config.bin_name),
             arg("workdir", config.core_dir().display()),
-            arg("config", config.config_path().display()),
+            arg("config", config.launch_config_path().display()),
         ],
     );
 
@@ -246,7 +246,7 @@ fn validate_core(config: &Config) -> Result<()> {
         LogKey::CoreCheck,
         &[
             arg("bin", config.bin_path.display()),
-            arg("config", config.config_path().display()),
+            arg("config", config.launch_config_path().display()),
         ],
     );
 
@@ -261,10 +261,16 @@ fn validate_core(config: &Config) -> Result<()> {
     if config.config_name.trim().is_empty() {
         return Err("config file not selected".to_string());
     }
-    if !config.config_path().is_file() {
+    if !config.source_config_path().is_file() {
         return Err(format!(
-            "config file not detected: {}",
-            config.config_path().display()
+            "source config file not detected: {}",
+            config.source_config_path().display()
+        ));
+    }
+    if config.uses_runtime_config() && !config.launch_config_path().is_file() {
+        return Err(format!(
+            "runtime startup config not prepared: {}",
+            config.launch_config_path().display()
         ));
     }
     Ok(())

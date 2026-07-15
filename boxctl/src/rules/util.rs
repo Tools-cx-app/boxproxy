@@ -548,7 +548,7 @@ pub(super) fn ipset_source_stamp(source: &Path) -> Option<String> {
     let metadata = fs::metadata(source).ok()?;
     let len = metadata.len();
     let modified = metadata.modified().ok()?;
-    let modified = modified.duration_since(UNIX_EPOCH).ok()?.as_secs();
+    let modified = modified.duration_since(UNIX_EPOCH).ok()?.as_nanos();
     Some(format!("{len}:{modified}"))
 }
 

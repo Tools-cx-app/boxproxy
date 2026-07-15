@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::HashSet;
 
 const CAP_CACHE_FILE: &str = "iptables.cap.cache";
 
@@ -116,22 +117,22 @@ impl<'a> RuleManager<'a> {
             };
         }
 
+        let targets4 = capability_entries("/proc/net/ip_tables_targets");
+        let targets6 = capability_entries("/proc/net/ip6_tables_targets");
+        let matches4 = capability_entries("/proc/net/ip_tables_matches");
+        let matches6 = capability_entries("/proc/net/ip6_tables_matches");
+        let has_match = |name: &str| matches4.contains(name) || matches6.contains(name);
+        let has_target = |name: &str| targets4.contains(name) || targets6.contains(name);
         let mut caps = Capabilities {
-            tproxy4: self.cap_has_target(Family::V4, "TPROXY"),
-            tproxy6: self.cap_has_target(Family::V6, "TPROXY"),
-            socket_match: self.cap_has_match(Family::V4, "socket")
-                || self.cap_has_match(Family::V6, "socket"),
-            addrtype: self.cap_has_match(Family::V4, "addrtype")
-                || self.cap_has_match(Family::V6, "addrtype"),
-            conntrack_match: self.cap_has_match(Family::V4, "conntrack")
-                || self.cap_has_match(Family::V6, "conntrack"),
-            connmark_match: self.cap_has_match(Family::V4, "connmark")
-                || self.cap_has_match(Family::V6, "connmark"),
-            connmark_target: self.cap_has_target(Family::V4, "CONNMARK")
-                || self.cap_has_target(Family::V6, "CONNMARK"),
+            tproxy4: targets4.contains("TPROXY"),
+            tproxy6: targets6.contains("TPROXY"),
+            socket_match: has_match("socket"),
+            addrtype: has_match("addrtype"),
+            conntrack_match: has_match("conntrack"),
+            connmark_match: has_match("connmark"),
+            connmark_target: has_target("CONNMARK"),
             ipset: self.config.bypass_cn_ip && self.ipset_available(),
-            bpf_match: self.cap_has_match(Family::V4, "bpf")
-                || self.cap_has_match(Family::V6, "bpf"),
+            bpf_match: has_match("bpf"),
             ip6_nat: self.config.ipv6 && self.ip6_nat_supported(),
             restore4: self.probe_restore_support(Family::V4),
             restore6: self.config.ipv6 && self.probe_restore_support(Family::V6),
@@ -154,26 +155,6 @@ impl<'a> RuleManager<'a> {
         self.ipt_silent(family, &["-t", "mangle", "-F", PROBE_CHAIN]);
         self.ipt_silent(family, &["-t", "mangle", "-X", PROBE_CHAIN]);
         ok
-    }
-
-    pub(super) fn cap_has_target(&self, family: Family, target: &str) -> bool {
-        let path = match family {
-            Family::V4 => "/proc/net/ip_tables_targets",
-            Family::V6 => "/proc/net/ip6_tables_targets",
-        };
-        fs::read_to_string(path)
-            .map(|text| text.split_whitespace().any(|value| value == target))
-            .unwrap_or(false)
-    }
-
-    pub(super) fn cap_has_match(&self, family: Family, target: &str) -> bool {
-        let path = match family {
-            Family::V4 => "/proc/net/ip_tables_matches",
-            Family::V6 => "/proc/net/ip6_tables_matches",
-        };
-        fs::read_to_string(path)
-            .map(|text| text.split_whitespace().any(|value| value == target))
-            .unwrap_or(false)
     }
 
     pub(super) fn cap_socket_transparent(&self, socket_match: bool) -> bool {
@@ -209,4 +190,10 @@ impl<'a> RuleManager<'a> {
         }
         self.ipt_check(Family::V6, &["-t", "nat", "-L"])
     }
+}
+
+fn capability_entries(path: &str) -> HashSet<String> {
+    fs::read_to_string(path)
+        .map(|text| text.split_whitespace().map(str::to_string).collect())
+        .unwrap_or_default()
 }

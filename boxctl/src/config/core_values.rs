@@ -3,7 +3,7 @@ use std::path::Path;
 
 use jsonc_parser::ParseOptions;
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct CoreConfigValues {
     pub(super) read_status: String,
     pub(super) mihomo_dns_port: Option<String>,
@@ -13,6 +13,13 @@ pub(super) struct CoreConfigValues {
 }
 
 impl CoreConfigValues {
+    pub(super) fn skipped() -> Self {
+        Self {
+            read_status: "not read (higher-priority values are configured)".to_string(),
+            ..Self::default()
+        }
+    }
+
     pub(super) fn read(bin_name: &str, network_mode: &str, config_path: &Path) -> Self {
         let text = match fs::read_to_string(config_path) {
             Ok(text) => text,
@@ -34,79 +41,97 @@ impl CoreConfigValues {
     }
 
     fn read_mihomo(text: &str, network_mode: &str) -> Self {
-        let values: serde_yaml::Value = serde_yaml::from_str(text).unwrap();
+        let mut values: serde_norway::Value = match serde_norway::from_str(text) {
+            Ok(values) => values,
+            Err(err) => {
+                return Self {
+                    read_status: format!("parse failed: {err}"),
+                    ..Self::default()
+                };
+            }
+        };
+        if let Err(err) = values.apply_merge() {
+            return Self {
+                read_status: format!("parse failed: {err}"),
+                ..Self::default()
+            };
+        }
+        let dns = values.get("dns");
         Self {
             read_status: "read mihomo config".to_string(),
-            mihomo_dns_port: values.get("dns").unwrap().get("listen").and_then(|v| {
-                v.as_str()
-                    .unwrap()
-                    .split_once(':').map(|v| v.1.to_string())
-            }),
+            mihomo_dns_port: dns
+                .and_then(|value| value.get("listen"))
+                .and_then(yaml_string)
+                .and_then(|value| value.rsplit_once(':').map(|(_, port)| port.to_string())),
             tun_device: if matches!(network_mode, "tun" | "mixed") {
-                values.get("tun").and_then(|v| {
-                    v.get("device")
-                        .map_or_else(|| None, |v| Some(v.as_str().unwrap().to_string()))
-                })
+                values
+                    .get("tun")
+                    .and_then(|value| value.get("device"))
+                    .and_then(yaml_string)
+                    .map(ToOwned::to_owned)
             } else {
                 None
             },
-            fake_ip_range: values
-                .get("dns")
-                .unwrap()
-                .get("fake-ip-range").map(|v| v.as_str().unwrap().to_string()),
-            fake_ip6_range: values
-                .get("dns")
-                .unwrap()
-                .get("fake-ip-range6").map(|v| v.as_str().unwrap().to_string()),
+            fake_ip_range: dns
+                .and_then(|value| value.get("fake-ip-range"))
+                .and_then(yaml_string)
+                .map(ToOwned::to_owned),
+            fake_ip6_range: dns
+                .and_then(|value| value.get("fake-ip-range6"))
+                .and_then(yaml_string)
+                .map(ToOwned::to_owned),
         }
     }
 
     fn read_sing_box(text: &str, network_mode: &str) -> Self {
         let values: serde_json::Value =
-            jsonc_parser::parse_to_serde_value(text, &ParseOptions::default()).unwrap();
+            match jsonc_parser::parse_to_serde_value(text, &ParseOptions::default()) {
+                Ok(values) => values,
+                Err(err) => {
+                    return Self {
+                        read_status: format!("parse failed: {err}"),
+                        ..Self::default()
+                    };
+                }
+            };
+        let dns_servers = values
+            .get("dns")
+            .and_then(|value| value.get("servers"))
+            .and_then(serde_json::Value::as_array);
         Self {
             read_status: "read sing-box config".to_string(),
             mihomo_dns_port: None,
             tun_device: if matches!(network_mode, "tun" | "mixed") {
                 values
                     .get("inbounds")
-                    .unwrap()
-                    .as_array()
-                    .unwrap()
-                    .iter()
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
                     .find(|v| v.get("interface_name").is_some())
-                    .and_then(|v| {
-                        v.get("interface_name").map(|v| v.as_str().unwrap().to_string())
-                    })
+                    .and_then(|value| value.get("interface_name"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToOwned::to_owned)
             } else {
                 None
             },
-            fake_ip_range: values
-                .get("dns")
-                .unwrap()
-                .get("servers")
-                .unwrap()
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|v| v.get("inet4_range").is_some())
-                .and_then(|v| {
-                    v.get("inet4_range").map(|v| v.as_str().unwrap().to_string())
-                }),
-            fake_ip6_range: values
-                .get("dns")
-                .unwrap()
-                .get("servers")
-                .unwrap()
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|v| v.get("inet6_range").is_some())
-                .and_then(|v| {
-                    v.get("inet6_range").map(|v| v.as_str().unwrap().to_string())
-                }),
+            fake_ip_range: dns_servers
+                .into_iter()
+                .flatten()
+                .find_map(|value| value.get("inet4_range"))
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned),
+            fake_ip6_range: dns_servers
+                .into_iter()
+                .flatten()
+                .find_map(|value| value.get("inet6_range"))
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned),
         }
     }
+}
+
+fn yaml_string(value: &serde_norway::Value) -> Option<&str> {
+    value.as_str()
 }
 
 pub(super) fn value_source(
@@ -189,5 +214,39 @@ pub(super) fn default_fake_ip6_range(bin_name: &str) -> String {
         "fc00::/18".to_string()
     } else {
         String::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn malformed_mihomo_config_returns_status_instead_of_panicking() {
+        let values = CoreConfigValues::read_mihomo("dns: [", "tun");
+        assert!(values.read_status.starts_with("parse failed:"));
+    }
+
+    #[test]
+    fn flow_mihomo_config_reads_scalar_values() {
+        let values = CoreConfigValues::read_mihomo(
+            "dns: { listen: \"0.0.0.0:1053\", fake-ip-range: 198.18.0.1/16 }\ntun: { device: meta }\n",
+            "tun",
+        );
+        assert_eq!(values.mihomo_dns_port.as_deref(), Some("1053"));
+        assert_eq!(values.tun_device.as_deref(), Some("meta"));
+        assert_eq!(values.fake_ip_range.as_deref(), Some("198.18.0.1/16"));
+    }
+
+    #[test]
+    fn merged_mihomo_config_reads_effective_values() {
+        let values = CoreConfigValues::read_mihomo(
+            "defaults: &defaults\n  listen: \"0.0.0.0:1053\"\n  fake-ip-range: 198.18.0.1/16\ndns:\n  <<: *defaults\ntun: &tun\n  device: meta\n",
+            "tun",
+        );
+
+        assert_eq!(values.mihomo_dns_port.as_deref(), Some("1053"));
+        assert_eq!(values.fake_ip_range.as_deref(), Some("198.18.0.1/16"));
+        assert_eq!(values.tun_device.as_deref(), Some("meta"));
     }
 }

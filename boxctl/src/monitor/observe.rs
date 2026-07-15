@@ -14,17 +14,19 @@ pub(super) fn current_observation_cached(
 fn observe_with_iface(runner: &Runner, iface_cache: &mut Option<String>) -> WifiObservation {
     let wifi_status = run_output(runner, "cmd", &["wifi", "status"]);
     let iface = resolve_wifi_iface(runner, wifi_status.as_deref(), iface_cache);
-    let ssid = get_current_ssid(runner, &iface, wifi_status.as_deref());
-    let bssid = get_current_bssid(runner, &iface, wifi_status.as_deref());
-    let connected = if wifi_status.is_some() {
-        wifi_status_connected(wifi_status.as_deref(), &ssid, &bssid)
+    let (ssid, bssid) = get_current_link(runner, &iface, wifi_status.as_deref());
+    let (connected, ip) = if wifi_status.is_some() {
+        let connected = wifi_status_connected(wifi_status.as_deref(), &ssid, &bssid);
+        let ip = connected.then(|| get_wifi_ip(runner, &iface)).flatten();
+        (connected, ip)
     } else {
-        wifi_iface_has_address(runner, &iface)
-    };
-    let ip = if connected {
-        get_wifi_ip(runner, &iface)
-    } else {
-        None
+        let address = run_output(runner, "ip", &["addr", "show", &iface]);
+        let connected = address
+            .as_deref()
+            .map(wifi_address_present)
+            .unwrap_or(false);
+        let ip = address.as_deref().and_then(extract_ipv4);
+        (connected, ip)
     };
 
     WifiObservation {
@@ -41,8 +43,13 @@ fn resolve_wifi_iface(
     wifi_status: Option<&str>,
     iface_cache: &mut Option<String>,
 ) -> String {
+    if let Some(iface) = wifi_status.and_then(parse_client_mode_iface) {
+        *iface_cache = Some(iface.clone());
+        return iface;
+    }
+
     if let Some(cached) = iface_cache.as_deref() {
-        if runner.run_ok("ip", &["link", "show", cached]) {
+        if std::path::Path::new("/sys/class/net").join(cached).exists() {
             return cached.to_string();
         }
     }
@@ -54,9 +61,7 @@ fn resolve_wifi_iface(
 
 pub(super) fn get_wifi_iface(runner: &Runner, wifi_status: Option<&str>) -> String {
     if let Some(iface) = wifi_status.and_then(parse_client_mode_iface) {
-        if runner.run_ok("ip", &["link", "show", iface.as_str()]) {
-            return iface;
-        }
+        return iface;
     }
 
     if let Some(iface) =
@@ -111,91 +116,83 @@ pub(super) fn get_wifi_iface(runner: &Runner, wifi_status: Option<&str>) -> Stri
     "wlan0".to_string()
 }
 
-pub(super) fn wifi_iface_has_address(runner: &Runner, iface: &str) -> bool {
-    run_output(runner, "ip", &["addr", "show", iface])
-        .map(|text| {
-            text.lines().any(|line| {
-                let trimmed = line.trim();
-                trimmed.starts_with("inet ")
-                    || (trimmed.starts_with("inet6 ") && trimmed.contains(" scope global"))
-            })
-        })
-        .unwrap_or(false)
-}
-
-pub(super) fn get_current_ssid(runner: &Runner, iface: &str, wifi_status: Option<&str>) -> String {
+fn get_current_link(runner: &Runner, iface: &str, wifi_status: Option<&str>) -> (String, String) {
     let mut ssid = wifi_status.and_then(|text| parse_quoted_label(text, "SSID"));
-
-    if option_empty_or(ssid.as_deref(), |value| value == "<unknown ssid>") {
-        ssid = run_output(runner, "iw", &["dev", iface, "link"]).and_then(|text| {
-            extract_after_prefix(&text, "SSID:").map(|value| {
-                value
-                    .trim_matches('"')
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or("")
-                    .to_string()
-            })
-        });
-    }
-
-    if option_empty_or(ssid.as_deref(), |value| value == "<unknown ssid>") {
-        ssid = run_output(runner, "iwconfig", &[iface]).and_then(|text| {
-            extract_after_prefix(&text, "ESSID:").map(|value| {
-                value
-                    .trim_matches('"')
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or("")
-                    .to_string()
-            })
-        });
-    }
-
-    match ssid.map(|value| value.trim().to_string()) {
-        Some(value) if !value.is_empty() && value != "off/any" => value,
-        _ => "unknown".to_string(),
-    }
-}
-
-pub(super) fn get_current_bssid(runner: &Runner, iface: &str, wifi_status: Option<&str>) -> String {
     let mut bssid = wifi_status.and_then(parse_bssid_label);
 
-    if option_empty_or(bssid.as_deref(), |value| value == "<none>") {
-        bssid = run_output(runner, "iw", &["dev", iface, "link"])
-            .and_then(|text| extract_connected_to(&text));
+    if option_empty_or(ssid.as_deref(), |value| value == "<unknown ssid>")
+        || option_empty_or(bssid.as_deref(), |value| value == "<none>")
+    {
+        if let Some(text) = run_output(runner, "iw", &["dev", iface, "link"]) {
+            if option_empty_or(ssid.as_deref(), |value| value == "<unknown ssid>") {
+                ssid = extract_after_prefix(&text, "SSID:").map(|value| {
+                    value
+                        .trim_matches('"')
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .to_string()
+                });
+            }
+            if option_empty_or(bssid.as_deref(), |value| value == "<none>") {
+                bssid = extract_connected_to(&text);
+            }
+        }
     }
 
-    if option_empty_or(bssid.as_deref(), |value| value == "Not-Associated") {
-        bssid = run_output(runner, "iwconfig", &[iface])
-            .and_then(|text| extract_after_prefix(&text, "Access Point:"));
+    if option_empty_or(ssid.as_deref(), |value| value == "<unknown ssid>")
+        || option_empty_or(bssid.as_deref(), |value| value == "Not-Associated")
+    {
+        if let Some(text) = run_output(runner, "iwconfig", &[iface]) {
+            if option_empty_or(ssid.as_deref(), |value| value == "<unknown ssid>") {
+                ssid = extract_after_prefix(&text, "ESSID:").map(|value| {
+                    value
+                        .trim_matches('"')
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .to_string()
+                });
+            }
+            if option_empty_or(bssid.as_deref(), |value| value == "Not-Associated") {
+                bssid = extract_after_prefix(&text, "Access Point:");
+            }
+        }
     }
 
-    match bssid.map(normalize_bssid) {
+    let ssid = match ssid.map(|value| value.trim().to_string()) {
+        Some(value) if !value.is_empty() && value != "off/any" => value,
+        _ => "unknown".to_string(),
+    };
+    let bssid = match bssid.map(normalize_bssid) {
         Some(value) if !value.is_empty() && value != "00:00:00:00:00:00" => value,
         _ => "unknown".to_string(),
-    }
+    };
+    (ssid, bssid)
 }
 
 pub(super) fn get_wifi_ip(runner: &Runner, iface: &str) -> Option<String> {
     run_output(runner, "ip", &["addr", "show", iface]).and_then(|text| extract_ipv4(&text))
 }
 
+fn wifi_address_present(text: &str) -> bool {
+    text.lines().any(|line| {
+        let trimmed = line.trim();
+        trimmed.starts_with("inet ")
+            || (trimmed.starts_with("inet6 ") && trimmed.contains(" scope global"))
+    })
+}
+
 pub(super) fn run_output(runner: &Runner, program: &str, args: &[&str]) -> Option<String> {
     // `Runner::run` accepts `&[impl AsRef<str>]`, so the `&[&str]` goes straight
     // through with no intermediate `Vec<String>` allocation on this per-event path.
-    runner
-        .run(program, args)
-        .ok()
-        .and_then(|output| {
-            let stdout = output.stdout.trim().to_string();
-            if stdout.is_empty() {
-                None
-            } else {
-                Some(stdout)
-            }
-        })
-        .filter(|text| !text.trim().is_empty())
+    runner.run(program, args).ok().and_then(|output| {
+        if output.stdout.is_empty() {
+            None
+        } else {
+            Some(output.stdout)
+        }
+    })
 }
 
 pub(super) fn parse_client_mode_iface(text: &str) -> Option<String> {

@@ -1,4 +1,19 @@
 use super::*;
+use std::collections::HashSet;
+
+pub(super) struct WifiSettings {
+    pub(super) network_control_enabled: bool,
+    pub(super) use_on_wifi_disconnect: bool,
+    pub(super) use_on_wifi_connect: bool,
+    pub(super) enable_ssid_matching: bool,
+    pub(super) enable_network_control_log: bool,
+    pub(super) list_mode: String,
+}
+
+pub(super) struct HotspotSettings {
+    pub(super) mac_filter: bool,
+    pub(super) mac_mode: String,
+}
 
 pub(super) fn load_profile(conn: &Connection) -> Result<RuntimeData> {
     let row = conn
@@ -90,7 +105,7 @@ pub(super) fn read_app_setting(conn: &Connection, key: &str, default: &str) -> S
 }
 
 pub(super) fn read_uid_list(conn: &Connection, table: &str, column: &str) -> Vec<String> {
-    let sql = format!("SELECT {column} FROM {table} ORDER BY {column}");
+    let sql = format!("SELECT DISTINCT {column} FROM {table} ORDER BY {column}");
     let mut stmt = match conn.prepare(&sql) {
         Ok(stmt) => stmt,
         Err(_) => return Vec::new(),
@@ -103,32 +118,71 @@ pub(super) fn read_uid_list(conn: &Connection, table: &str, column: &str) -> Vec
         Err(_) => return Vec::new(),
     };
 
-    let mut values: Vec<String> = rows.filter_map(|row| row.ok()).collect();
-    values.sort();
-    values.dedup();
-    values
+    rows.filter_map(|row| row.ok()).collect()
 }
 
-pub(super) fn read_wifi_flag(
-    conn: &Connection,
-    table: &str,
-    column: &str,
-    default: bool,
-) -> Result<bool> {
-    let sql = format!("SELECT {column} FROM {table} WHERE id = 1");
-    let value: Option<i64> = conn.query_row(&sql, [], |row| row.get(0)).ok();
-    Ok(value.map(|value| value != 0).unwrap_or(default))
+pub(super) fn read_wifi_settings(conn: &Connection) -> Result<WifiSettings> {
+    let values = conn.query_row(
+        "SELECT network_control_enabled, use_on_wifi_disconnect, use_on_wifi_connect, \
+         enable_ssid_matching, enable_network_control_log, list_mode \
+         FROM wifi_match_settings WHERE id = 1",
+        [],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        },
+    );
+    match values {
+        Ok((
+            network_control_enabled,
+            use_on_wifi_disconnect,
+            use_on_wifi_connect,
+            enable_ssid_matching,
+            enable_network_control_log,
+            list_mode,
+        )) => Ok(WifiSettings {
+            network_control_enabled: network_control_enabled != 0,
+            use_on_wifi_disconnect: use_on_wifi_disconnect != 0,
+            use_on_wifi_connect: use_on_wifi_connect != 0,
+            enable_ssid_matching: enable_ssid_matching != 0,
+            enable_network_control_log: enable_network_control_log != 0,
+            list_mode,
+        }),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(WifiSettings {
+            network_control_enabled: false,
+            use_on_wifi_disconnect: true,
+            use_on_wifi_connect: true,
+            enable_ssid_matching: false,
+            enable_network_control_log: true,
+            list_mode: "blacklist".to_string(),
+        }),
+        Err(err) => Err(format!("read wifi_match_settings failed: {err}")),
+    }
 }
 
-pub(super) fn read_wifi_text(
-    conn: &Connection,
-    table: &str,
-    column: &str,
-    default: &str,
-) -> Result<String> {
-    let sql = format!("SELECT {column} FROM {table} WHERE id = 1");
-    let value: Option<String> = conn.query_row(&sql, [], |row| row.get(0)).ok();
-    Ok(value.unwrap_or_else(|| default.to_string()))
+pub(super) fn read_hotspot_settings(conn: &Connection) -> Result<HotspotSettings> {
+    let values = conn.query_row(
+        "SELECT mac_filter, mac_mode FROM hotspot_settings WHERE id = 1",
+        [],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+    );
+    match values {
+        Ok((mac_filter, mac_mode)) => Ok(HotspotSettings {
+            mac_filter: mac_filter != 0,
+            mac_mode,
+        }),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(HotspotSettings {
+            mac_filter: false,
+            mac_mode: "blacklist".to_string(),
+        }),
+        Err(err) => Err(format!("read hotspot_settings failed: {err}")),
+    }
 }
 
 pub(super) fn read_string_list(
@@ -147,10 +201,11 @@ pub(super) fn read_string_list(
         })
         .map_err(|err| format!("read {table} failed: {err}"))?;
 
+    let mut seen = HashSet::new();
     let mut values = Vec::new();
     for value in rows.filter_map(|row| row.ok()) {
         let value = value.trim().to_string();
-        if !value.is_empty() && !values.iter().any(|item| item == &value) {
+        if !value.is_empty() && seen.insert(value.clone()) {
             values.push(value);
         }
     }

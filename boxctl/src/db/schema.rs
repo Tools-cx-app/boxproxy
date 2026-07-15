@@ -1,22 +1,42 @@
 use super::*;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 pub(super) fn ensure_schema(conn: &Connection) -> Result<()> {
     let current: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .map_err(|err| format!("read database schema version failed: {err}"))?;
-    if current < SCHEMA_VERSION {
-        migrate_schema(conn)?;
-
-        conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
-            .map_err(|err| format!("update database schema version failed: {err}"))?;
+    if current >= SCHEMA_VERSION {
+        return Ok(());
     }
 
-    ensure_additive_schema(conn)
+    conn.execute_batch("BEGIN IMMEDIATE")
+        .map_err(|err| format!("begin database schema migration failed: {err}"))?;
+    let migration = migrate_schema(conn, current).and_then(|()| {
+        conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
+            .map_err(|err| format!("update database schema version failed: {err}"))
+    });
+    match migration {
+        Ok(()) => conn
+            .execute_batch("COMMIT")
+            .map_err(|err| format!("commit database schema migration failed: {err}")),
+        Err(err) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(err)
+        }
+    }
 }
 
-fn migrate_schema(conn: &Connection) -> Result<()> {
+fn migrate_schema(conn: &Connection, current: i64) -> Result<()> {
+    if current < 1 {
+        initialize_schema(conn)?;
+    } else {
+        migrate_v2(conn)?;
+    }
+    Ok(())
+}
+
+fn initialize_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS runtime_profile (
@@ -125,60 +145,45 @@ fn migrate_schema(conn: &Connection) -> Result<()> {
         "#,
     )
     .map_err(|err| format!("initialize database schema failed: {err}"))?;
-    ensure_additive_schema(conn)
+    Ok(())
 }
 
-fn ensure_additive_schema(conn: &Connection) -> Result<()> {
-    ensure_column(
+fn migrate_v2(conn: &Connection) -> Result<()> {
+    ensure_columns(
         conn,
         "runtime_profile",
-        "boot_auto_start",
-        "INTEGER NOT NULL DEFAULT 0",
+        &[
+            ("boot_auto_start", "INTEGER NOT NULL DEFAULT 0"),
+            ("clean_vendor_firewall", "INTEGER NOT NULL DEFAULT 0"),
+            ("ipv6_mode", "TEXT NOT NULL DEFAULT 'enable'"),
+            ("taskset_cpu", "INTEGER NOT NULL DEFAULT 0"),
+        ],
     )?;
-    ensure_column(
-        conn,
-        "runtime_profile",
-        "clean_vendor_firewall",
-        "INTEGER NOT NULL DEFAULT 0",
-    )?;
-    ensure_column(
-        conn,
-        "runtime_profile",
-        "ipv6_mode",
-        "TEXT NOT NULL DEFAULT 'enable'",
-    )?;
-    ensure_column(
-        conn,
-        "runtime_profile",
-        "taskset_cpu",
-        "INTEGER NOT NULL DEFAULT 0",
-    )?;
-    ensure_column(
+    ensure_columns(
         conn,
         "cnip_settings",
-        "cnip_mode",
-        "TEXT NOT NULL DEFAULT 'ipset'",
+        &[("cnip_mode", "TEXT NOT NULL DEFAULT 'ipset'")],
     )?;
     Ok(())
 }
 
-pub(super) fn ensure_column(
-    conn: &Connection,
-    table: &str,
-    column: &str,
-    definition: &str,
-) -> Result<()> {
-    if column_exists(conn, table, column)? {
-        return Ok(());
+fn ensure_columns(conn: &Connection, table: &str, columns: &[(&str, &str)]) -> Result<()> {
+    let existing = table_columns(conn, table)?;
+    for (column, definition) in columns {
+        if existing
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(column))
+        {
+            continue;
+        }
+        let sql = format!("ALTER TABLE {table} ADD COLUMN {column} {definition}");
+        conn.execute(&sql, [])
+            .map_err(|err| format!("update {table}.{column} failed: {err}"))?;
     }
-
-    let sql = format!("ALTER TABLE {table} ADD COLUMN {column} {definition}");
-    conn.execute(&sql, [])
-        .map_err(|err| format!("update {table}.{column} failed: {err}"))?;
     Ok(())
 }
 
-fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
     let pragma = format!("PRAGMA table_info({table})");
     let mut stmt = conn
         .prepare(&pragma)
@@ -187,13 +192,36 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
         .query_map([], |row| row.get::<_, String>(1))
         .map_err(|err| format!("read {table} schema failed: {err}"))?;
 
-    for item in columns {
-        if item
-            .map_err(|err| format!("read {table} schema failed: {err}"))?
-            .eq_ignore_ascii_case(column)
-        {
-            return Ok(true);
-        }
+    columns
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|err| format!("read {table} schema failed: {err}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn migrates_version_one_schema_once_and_updates_user_version() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE runtime_profile (id INTEGER PRIMARY KEY);
+            CREATE TABLE cnip_settings (id INTEGER PRIMARY KEY);
+            PRAGMA user_version = 1;
+            ",
+        )
+        .unwrap();
+
+        ensure_schema(&conn).unwrap();
+
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let profile_columns = table_columns(&conn, "runtime_profile").unwrap();
+        assert!(profile_columns.iter().any(|column| column == "taskset_cpu"));
+        let cnip_columns = table_columns(&conn, "cnip_settings").unwrap();
+        assert!(cnip_columns.iter().any(|column| column == "cnip_mode"));
     }
-    Ok(false)
 }

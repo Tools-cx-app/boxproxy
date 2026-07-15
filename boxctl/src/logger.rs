@@ -4,7 +4,7 @@ use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 const STDOUT_LOG_LINE_ENV: &str = "BOXCTL_STDOUT_LOG_LINE";
 
@@ -196,8 +196,10 @@ fn write_console(level: &str, line: &str, message: &str) {
     }
 }
 
-fn log_handles() -> &'static Mutex<HashMap<PathBuf, File>> {
-    static HANDLES: OnceLock<Mutex<HashMap<PathBuf, File>>> = OnceLock::new();
+type LogFile = Arc<Mutex<File>>;
+
+fn log_handles() -> &'static Mutex<HashMap<PathBuf, LogFile>> {
+    static HANDLES: OnceLock<Mutex<HashMap<PathBuf, LogFile>>> = OnceLock::new();
     HANDLES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -206,25 +208,39 @@ fn write_line(path: &Path, line: &str) {
     record.push_str(line);
     record.push('\n');
 
-    let mut handles = match log_handles().lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
+    let handle = {
+        let mut handles = match log_handles().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(file) = handles.get(path) {
+            Arc::clone(file)
+        } else {
+            if let Some(parent) = path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let Ok(file) = OpenOptions::new().create(true).append(true).open(path) else {
+                return;
+            };
+            let file = Arc::new(Mutex::new(file));
+            handles.insert(path.to_path_buf(), Arc::clone(&file));
+            file
+        }
     };
 
-    if !handles.contains_key(path) {
-        if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        match OpenOptions::new().create(true).append(true).open(path) {
-            Ok(file) => {
-                handles.insert(path.to_path_buf(), file);
-            }
-            Err(_) => return,
-        }
-    }
-
-    if let Some(file) = handles.get_mut(path) {
-        if file.write_all(record.as_bytes()).is_err() {
+    let write_failed = match handle.lock() {
+        Ok(mut file) => file.write_all(record.as_bytes()).is_err(),
+        Err(poisoned) => poisoned.into_inner().write_all(record.as_bytes()).is_err(),
+    };
+    if write_failed {
+        let mut handles = match log_handles().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if handles
+            .get(path)
+            .is_some_and(|current| Arc::ptr_eq(current, &handle))
+        {
             handles.remove(path);
         }
     }

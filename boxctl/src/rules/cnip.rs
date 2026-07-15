@@ -1,4 +1,10 @@
 use super::*;
+use std::io::{BufRead, BufReader};
+
+struct EbpfConfigFile {
+    path: PathBuf,
+    fingerprint: String,
+}
 
 impl<'a> RuleManager<'a> {
     pub(super) fn setup_cn_ipset_if_needed(&self, capabilities: &Capabilities) -> Result<()> {
@@ -67,25 +73,30 @@ impl<'a> RuleManager<'a> {
             return Ok(());
         }
 
-        let text = fs::read_to_string(source)
-            .map_err(|err| format!("read CNIP file {} failed: {err}", source.display()))?;
-        let mut input = format!(
-            "create {name} hash:net family {family} hashsize 8192 maxelem 65536 -exist\nflush {name}\n"
-        );
-        for line in text.lines() {
-            let value = line.trim();
-            if value.is_empty() || value.starts_with('#') {
-                continue;
-            }
-            input.push_str("add ");
-            input.push_str(name);
-            input.push(' ');
-            input.push_str(value);
-            input.push('\n');
-        }
-
+        let source_file = fs::File::open(source)
+            .map_err(|err| format!("open CNIP file {} failed: {err}", source.display()))?;
         let args = strings(&["restore", "-exist"]);
-        let output = self.runner.run_with_stdin_output("ipset", &args, &input)?;
+        let output = self
+            .runner
+            .run_with_stdin_writer("ipset", &args, move |stdin| {
+                writeln!(
+                    stdin,
+                    "create {name} hash:net family {family} hashsize 8192 maxelem 65536 -exist"
+                )
+                .map_err(|err| format!("write ipset header failed: {err}"))?;
+                writeln!(stdin, "flush {name}")
+                    .map_err(|err| format!("write ipset flush failed: {err}"))?;
+                for line in BufReader::new(source_file).lines() {
+                    let line = line.map_err(|err| format!("read CNIP line failed: {err}"))?;
+                    let value = line.trim();
+                    if value.is_empty() || value.starts_with('#') {
+                        continue;
+                    }
+                    writeln!(stdin, "add {name} {value}")
+                        .map_err(|err| format!("write ipset entry failed: {err}"))?;
+                }
+                Ok(())
+            })?;
         if output.ok {
             self.write_ipset_stamp(name, source);
             logger::info_key(self.config, LogKey::CnipImported, &[arg("name", name)]);
@@ -128,7 +139,7 @@ impl<'a> RuleManager<'a> {
         self.runner.run_ignore("rmdir", &[EBPF_PIN_DIR]);
     }
 
-    pub(super) fn write_rule_ebpf_config(&self, context: &RuleContext) -> Result<PathBuf> {
+    fn write_rule_ebpf_config(&self, context: &RuleContext) -> Result<EbpfConfigFile> {
         let dir = self.config.paths.state.join("ebpf");
         fs::create_dir_all(&dir)
             .map_err(|err| format!("create eBPF state directory failed: {err}"))?;
@@ -185,9 +196,30 @@ impl<'a> RuleManager<'a> {
         let config_path = self.rule_ebpf_config_path();
         let text = serde_json::to_string_pretty(&config)
             .map_err(|err| format!("serialize eBPF config failed: {err}"))?;
-        fs::write(&config_path, format!("{text}\n"))
-            .map_err(|err| format!("write eBPF config {} failed: {err}", config_path.display()))?;
-        Ok(config_path)
+        let text = format!("{text}\n");
+        if fs::read_to_string(&config_path)
+            .map(|current| current != text)
+            .unwrap_or(true)
+        {
+            fs::write(&config_path, &text).map_err(|err| {
+                format!("write eBPF config {} failed: {err}", config_path.display())
+            })?;
+        }
+
+        Ok(EbpfConfigFile {
+            path: config_path,
+            fingerprint: format!(
+                "{text}cidr4={}\ncidr6={}\nforce_uids={}\napp_uids={}",
+                ipset_source_stamp(&cidr4).unwrap_or_else(|| "missing".to_string()),
+                ipset_source_stamp(&cidr6).unwrap_or_else(|| "missing".to_string()),
+                normalized_list(&self.config.cnip_force_uids).join(","),
+                if self.app_uid_ebpf_requested(context) {
+                    context.selected_uids.join(",")
+                } else {
+                    String::new()
+                },
+            ),
+        })
     }
 
     pub(super) fn rule_ebpf_config_path(&self) -> PathBuf {
@@ -196,6 +228,24 @@ impl<'a> RuleManager<'a> {
             .state
             .join("ebpf")
             .join("rule-config.json")
+    }
+
+    fn ebpf_reload_stamp_path(&self) -> PathBuf {
+        self.config
+            .paths
+            .state
+            .join("ebpf")
+            .join("rule-config.fingerprint")
+    }
+
+    fn ebpf_reload_is_current(&self, fingerprint: &str) -> bool {
+        fs::read_to_string(self.ebpf_reload_stamp_path())
+            .map(|current| current == fingerprint)
+            .unwrap_or(false)
+    }
+
+    fn save_ebpf_reload_fingerprint(&self, fingerprint: &str) {
+        let _ = fs::write(self.ebpf_reload_stamp_path(), fingerprint);
     }
 
     pub(super) fn run_ebpf_matcher(
@@ -267,7 +317,7 @@ impl<'a> RuleManager<'a> {
             ));
         }
 
-        let config_path = self.write_rule_ebpf_config(context)?;
+        let config = self.write_rule_ebpf_config(context)?;
         self.apply_ebpf_selinux_policy();
         self.runner.run_ignore(
             "chmod",
@@ -280,8 +330,9 @@ impl<'a> RuleManager<'a> {
         match mode {
             EbpfApplyMode::Start => {
                 self.run_ebpf_matcher("--clear", None, false)?;
-                match self.run_ebpf_matcher("--apply", Some(&config_path), cnip_required) {
+                match self.run_ebpf_matcher("--apply", Some(&config.path), cnip_required) {
                     Ok(()) => {
+                        self.save_ebpf_reload_fingerprint(&config.fingerprint);
                         if cnip_required {
                             logger::info_key(self.config, LogKey::CnipEbpfLoaded, &[]);
                         }
@@ -291,8 +342,12 @@ impl<'a> RuleManager<'a> {
                 }
             }
             EbpfApplyMode::UpdateThenStart => {
-                match self.run_ebpf_matcher("--update", Some(&config_path), true) {
+                if self.ebpf_reload_is_current(&config.fingerprint) {
+                    return Ok(());
+                }
+                match self.run_ebpf_matcher("--update", Some(&config.path), true) {
                     Ok(()) => {
+                        self.save_ebpf_reload_fingerprint(&config.fingerprint);
                         logger::info_key(self.config, LogKey::EbpfMapHotUpdated, &[]);
                         Ok(())
                     }
@@ -302,7 +357,10 @@ impl<'a> RuleManager<'a> {
                             LogKey::EbpfMapHotUpdateFailed,
                             &[arg("error", err)],
                         );
-                        self.run_ebpf_matcher("--apply", Some(&config_path), cnip_required)
+                        self.run_ebpf_matcher("--apply", Some(&config.path), cnip_required)
+                            .map(|()| {
+                                self.save_ebpf_reload_fingerprint(&config.fingerprint);
+                            })
                     }
                 }
             }
@@ -456,11 +514,7 @@ impl<'a> RuleManager<'a> {
         if self.runner.dry_run() {
             return true;
         }
-        self.runner
-            .run("ipset", &["--version"])
-            .ok()
-            .map(|output| output.ok)
-            .unwrap_or(false)
+        self.runner.run_ok("ipset", &["--version"])
     }
 
     pub(super) fn ipset_has_entries(&self, name: &str) -> bool {

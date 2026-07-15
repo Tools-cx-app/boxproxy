@@ -9,6 +9,7 @@ use std::os::unix::process::CommandExt;
 
 pub const SIGTERM: i32 = 15;
 pub const SIGKILL: i32 = 9;
+const CHILD_REAPER_STACK_SIZE: usize = 128 * 1024;
 
 #[cfg(unix)]
 unsafe extern "C" {
@@ -59,13 +60,27 @@ impl Runner {
     }
 
     pub fn run_ok<S: AsRef<str>>(&self, program: &str, args: &[S]) -> bool {
-        self.run(program, args)
-            .map(|output| output.ok)
-            .unwrap_or(false)
+        self.run_status(program, args).unwrap_or(false)
     }
 
     pub fn run_ignore<S: AsRef<str>>(&self, program: &str, args: &[S]) {
-        let _ = self.run(program, args);
+        let _ = self.run_status(program, args);
+    }
+
+    pub fn run_status<S: AsRef<str>>(&self, program: &str, args: &[S]) -> Result<bool> {
+        self.print_command(program, args);
+        if self.dry_run {
+            return Ok(false);
+        }
+
+        Command::new(program)
+            .args(args.iter().map(|value| value.as_ref()))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .map_err(|err| command_start_error("execute", program, err))
     }
 
     pub fn signal(&self, pid: i32, sig: i32) {
@@ -123,6 +138,53 @@ impl Runner {
         })
     }
 
+    pub fn run_with_stdin_writer<S: AsRef<str>, F>(
+        &self,
+        program: &str,
+        args: &[S],
+        write_input: F,
+    ) -> Result<Output>
+    where
+        F: FnOnce(&mut dyn Write) -> Result<()>,
+    {
+        self.print_command(program, args);
+        if self.dry_run {
+            return Ok(Output {
+                ok: true,
+                stdout: String::new(),
+                stderr: String::new(),
+            });
+        }
+
+        let mut child = Command::new(program)
+            .args(args.iter().map(|value| value.as_ref()))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|err| command_start_error("execute", program, err))?;
+        let write_result = child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| format!("open {program} stdin failed"))
+            .and_then(|stdin| write_input(stdin));
+        drop(child.stdin.take());
+        if let Err(err) = write_result {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(err);
+        }
+
+        let output = child
+            .wait_with_output()
+            .map_err(|err| format!("wait for {program} failed: {err}"))?;
+        Ok(Output {
+            ok: output.status.success(),
+            stdout: String::from_utf8_lossy(&output.stdout).trim().to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        })
+    }
+
     pub fn spawn_to_file_with_env_as<S: AsRef<str>>(
         &self,
         program: &str,
@@ -154,11 +216,20 @@ impl Runner {
         }
         apply_process_identity(&mut command, uid, gid);
 
-        let child = command
+        let mut child = command
             .spawn()
             .map_err(|err| command_start_error("start", program, err))?;
+        let pid = child.id();
 
-        Ok(Some(child.id()))
+        std::thread::Builder::new()
+            .name("boxctl-child-reaper".to_string())
+            .stack_size(CHILD_REAPER_STACK_SIZE)
+            .spawn(move || {
+                let _ = child.wait();
+            })
+            .map_err(|err| format!("start child reaper thread failed: {err}"))?;
+
+        Ok(Some(pid))
     }
 
     fn print_command<S: AsRef<str>>(&self, program: &str, args: &[S]) {

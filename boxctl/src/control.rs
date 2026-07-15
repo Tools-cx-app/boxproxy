@@ -6,6 +6,14 @@ use logger::{arg, LogKey};
 use std::thread;
 
 pub fn up(config: &Config, runner: &Runner) -> Result<()> {
+    up_inner(config, runner, true)
+}
+
+pub(crate) fn up_from_monitor(config: &Config, runner: &Runner) -> Result<()> {
+    up_inner(config, runner, false)
+}
+
+fn up_inner(config: &Config, runner: &Runner, manage_monitor: bool) -> Result<()> {
     logger::info_key(config, LogKey::StartupBegin, &logger::startup_args(config));
     if let Err(err) = core_config::sync(config) {
         log_startup_failed(config, &err);
@@ -19,21 +27,58 @@ pub fn up(config: &Config, runner: &Runner) -> Result<()> {
         (service_result, rules_result)
     });
 
-    if let Err(err) = service_result {
-        let _ = rules::clear(config, runner);
-        log_startup_failed(config, &err);
-        return Err(err);
+    if service_result.is_err() || rules_result.is_err() {
+        let mut failures = Vec::new();
+        if let Err(err) = service_result {
+            failures.push(format!("start core failed: {err}"));
+        }
+        if let Err(err) = rules_result {
+            failures.push(format!("apply rules failed: {err}"));
+        }
+
+        let error = rollback_startup(config, runner, failures.join("; "));
+        log_startup_failed(config, &error);
+        return Err(error);
     }
-    if let Err(err) = rules_result {
-        log_startup_failed(config, &err);
-        return Err(err);
-    }
-    if let Err(err) = monitor::run(config, runner) {
-        log_startup_failed(config, &err);
-        return Err(err);
+    if manage_monitor {
+        if let Err(err) = monitor::run(config, runner) {
+            let error = rollback_startup(config, runner, format!("start monitor failed: {err}"));
+            log_startup_failed(config, &error);
+            return Err(error);
+        }
     }
     logger::info_key(config, LogKey::StartupCompleted, &[]);
     Ok(())
+}
+
+fn rollback_startup(config: &Config, runner: &Runner, primary: String) -> String {
+    let (service_result, rules_result) = thread::scope(|scope| {
+        let rules_handle = scope.spawn(|| rules::clear(config, runner));
+        let service_result = service::stop(config, runner);
+        let rules_result = join_result(rules_handle.join(), "rules rollback thread panicked");
+        (service_result, rules_result)
+    });
+
+    let mut rollback_failures = Vec::new();
+    if let Err(err) = service_result {
+        rollback_failures.push(format!("stop core: {err}"));
+    }
+    if let Err(err) = rules_result {
+        rollback_failures.push(format!("clear rules: {err}"));
+    }
+
+    startup_failure_with_rollback(&primary, &rollback_failures)
+}
+
+fn startup_failure_with_rollback(primary: &str, rollback_failures: &[String]) -> String {
+    if rollback_failures.is_empty() {
+        primary.to_string()
+    } else {
+        format!(
+            "{primary}; rollback failed: {}",
+            rollback_failures.join("; ")
+        )
+    }
 }
 
 pub fn boot(config: &Config, runner: &Runner) -> Result<()> {
@@ -47,6 +92,14 @@ pub fn boot(config: &Config, runner: &Runner) -> Result<()> {
 }
 
 pub fn down(config: &Config, runner: &Runner) -> Result<()> {
+    down_inner(config, runner, true)
+}
+
+pub(crate) fn down_from_monitor(config: &Config, runner: &Runner) -> Result<()> {
+    down_inner(config, runner, false)
+}
+
+fn down_inner(config: &Config, runner: &Runner, manage_monitor: bool) -> Result<()> {
     logger::warn_key(
         config,
         LogKey::StopBegin,
@@ -65,7 +118,9 @@ pub fn down(config: &Config, runner: &Runner) -> Result<()> {
 
     rules_result?;
     service_result?;
-    monitor::run(config, runner)?;
+    if manage_monitor {
+        monitor::run(config, runner)?;
+    }
     logger::warn_key(config, LogKey::StopCompleted, &[]);
     Ok(())
 }
@@ -117,4 +172,24 @@ fn join_result(joined: std::thread::Result<Result<()>>, message: &str) -> Result
 
 fn log_startup_failed(config: &Config, error: &str) {
     logger::error_key(config, LogKey::StartupFailed, &[arg("error", error)]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::startup_failure_with_rollback;
+
+    #[test]
+    fn rollback_error_keeps_the_startup_failure() {
+        let error = startup_failure_with_rollback(
+            "apply rules failed: iptables failed",
+            &[
+                "stop core: process remains".to_string(),
+                "clear rules: restore failed".to_string(),
+            ],
+        );
+
+        assert!(error.contains("apply rules failed: iptables failed"));
+        assert!(error.contains("stop core: process remains"));
+        assert!(error.contains("clear rules: restore failed"));
+    }
 }

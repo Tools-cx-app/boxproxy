@@ -1,16 +1,5 @@
 use super::*;
 
-pub(super) fn app_proxy_filter_enabled(config: &Config) -> bool {
-    if config.network_mode == "tun" {
-        return false;
-    }
-
-    matches!(
-        config.proxy_mode.trim().to_ascii_lowercase().as_str(),
-        "blacklist" | "black" | "whitelist" | "white"
-    )
-}
-
 pub(super) fn tun_uid_lists(config: &Config) -> (Vec<String>, Vec<String>) {
     let uids = config.selected_uids.clone();
     match config.proxy_mode.as_str() {

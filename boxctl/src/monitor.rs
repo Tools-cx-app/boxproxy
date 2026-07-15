@@ -7,17 +7,19 @@ use crate::Result;
 use logger::{arg, LogKey};
 use std::env;
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::{self, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
+mod events;
 mod lock;
 mod observe;
 mod policy;
 mod state;
 mod watcher;
+use events::*;
 use lock::*;
 use observe::*;
 use policy::*;
@@ -37,6 +39,7 @@ const WIFI_IP_RETRY_DELAY_MS: u64 = 500;
 const WIFI_EVENT_DEBOUNCE_MS: u64 = 600;
 const WIFI_EVENT_MAX_DEBOUNCE_MS: u64 = 2000;
 const MONITOR_WORKER_ENV: &str = "BOXCTL_MONITOR_WORKER";
+const MONITOR_TOKEN_ENV: &str = "BOXCTL_MONITOR_TOKEN";
 
 #[derive(Clone, Debug)]
 struct WifiObservation {

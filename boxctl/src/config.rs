@@ -119,7 +119,8 @@ pub struct Config {
     pub intranet_cidrs4: Vec<String>,
     pub intranet_cidrs6: Vec<String>,
     pub config_name: String,
-    pub config_path: PathBuf,
+    pub source_config_path: PathBuf,
+    pub runtime_config_path: PathBuf,
 }
 
 impl BoxPaths {
@@ -157,7 +158,7 @@ impl Config {
             .clone()
             .unwrap_or_else(|| db_data.core_name.clone());
         let db_config_name = db_data.config_name.trim().to_string();
-        let (config_name, config_path) = match overrides.config_path.clone() {
+        let (config_name, source_config_path) = match overrides.config_path.clone() {
             Some(path) => {
                 let name = path
                     .file_name()
@@ -175,7 +176,6 @@ impl Config {
             .network_mode
             .clone()
             .unwrap_or_else(|| db_data.mode.clone());
-        let core_values = CoreConfigValues::read(&bin_name, &network_mode, &config_path);
         let default_mihomo_dns_port = default_mihomo_dns_port(&bin_name);
         let default_tun_device = default_tun_device(&bin_name, &network_mode);
         let default_fake_ip_range = default_fake_ip_range(&bin_name);
@@ -184,6 +184,17 @@ impl Config {
         let db_tun_device = non_empty_value(&db_data.tun_device);
         let db_fake_ip_range = non_empty_value(&db_data.fake_ip_range);
         let db_fake_ip6_range = non_empty_value(&db_data.fake_ip6_range);
+        let core_values = if core_config_values_needed(
+            &bin_name,
+            &network_mode,
+            auto_sync_config,
+            &overrides,
+            &db_data,
+        ) {
+            CoreConfigValues::read(&bin_name, &network_mode, &source_config_path)
+        } else {
+            CoreConfigValues::skipped()
+        };
         let sources = CoreConfigSources {
             read_status: core_values.read_status.clone(),
             mihomo_dns_port: value_source(
@@ -380,8 +391,9 @@ impl Config {
             macs_list: db_data.macs_list,
             intranet_cidrs4: db_data.intranet_cidrs4,
             intranet_cidrs6: db_data.intranet_cidrs6,
+            runtime_config_path: runtime_config_file_path(&paths),
             config_name,
-            config_path,
+            source_config_path,
         };
 
         Ok(config)
@@ -391,9 +403,73 @@ impl Config {
         self.paths.home.join(&self.bin_name)
     }
 
-    pub fn config_path(&self) -> &Path {
-        &self.config_path
+    pub fn source_config_path(&self) -> &Path {
+        &self.source_config_path
     }
+
+    pub fn runtime_config_path(&self) -> &Path {
+        &self.runtime_config_path
+    }
+
+    pub fn uses_runtime_config(&self) -> bool {
+        matches!(self.bin_name.as_str(), "mihomo" | "sing-box" | "hysteria")
+    }
+
+    pub fn launch_config_path(&self) -> &Path {
+        if self.uses_runtime_config() {
+            self.runtime_config_path()
+        } else {
+            self.source_config_path()
+        }
+    }
+}
+
+fn runtime_config_file_path(paths: &BoxPaths) -> PathBuf {
+    paths.state.join("startup-config")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_config_uses_one_fixed_state_file() {
+        let paths = BoxPaths {
+            home: PathBuf::from("/box"),
+            run: PathBuf::from("/box/run"),
+            state: PathBuf::from("/box/run/state"),
+            bin: PathBuf::from("/box/bin"),
+            db: PathBuf::from("/box/box.db"),
+        };
+
+        assert_eq!(
+            runtime_config_file_path(&paths),
+            PathBuf::from("/box/run/state/startup-config")
+        );
+    }
+}
+
+fn core_config_values_needed(
+    bin_name: &str,
+    network_mode: &str,
+    auto_sync_config: bool,
+    overrides: &ConfigOverrides,
+    db_data: &db::RuntimeData,
+) -> bool {
+    if !auto_sync_config {
+        return true;
+    }
+
+    let value_missing = |override_value: &Option<String>, db_value: &str| {
+        override_value.is_none() && db_value.trim().is_empty()
+    };
+    let tun_relevant = matches!(network_mode, "tun" | "mixed");
+    let fake_ip_relevant = matches!(bin_name, "mihomo" | "sing-box");
+
+    (bin_name == "mihomo" && value_missing(&overrides.mihomo_dns_port, &db_data.mihomo_dns_port))
+        || (tun_relevant && value_missing(&overrides.tun_device, &db_data.tun_device))
+        || (fake_ip_relevant && value_missing(&overrides.fake_ip_range, &db_data.fake_ip_range))
+        || (fake_ip_relevant && value_missing(&overrides.fake_ip6_range, &db_data.fake_ip6_range))
 }
 
 #[derive(Clone, Debug)]

@@ -170,6 +170,10 @@ impl<'a> RuleManager<'a> {
         cidrs: &[String],
     ) -> Result<(usize, usize)> {
         let chain = local_ip_chain(family);
+        if self.rebuild_local_ip_chain_with_restore(family, table, chain, cidrs) {
+            return Ok((cidrs.len(), 0));
+        }
+
         self.ensure_chain(family, table, chain)?;
 
         let mut ok = 0;
@@ -182,6 +186,52 @@ impl<'a> RuleManager<'a> {
             }
         }
         Ok((ok, failed))
+    }
+
+    fn rebuild_local_ip_chain_with_restore(
+        &self,
+        family: Family,
+        table: &str,
+        chain: &str,
+        cidrs: &[String],
+    ) -> bool {
+        if !self.restore_supported(family) {
+            return false;
+        }
+
+        self.ipt_silent(family, &["-t", table, "-N", chain]);
+        let input = local_ip_restore_input(table, chain, cidrs);
+        let args = strings(&["-w", IPTABLES_LOCK_WAIT_SECS, "--noflush"]);
+        match self
+            .runner
+            .run_with_stdin_output(restore_cmd(family), &args, &input)
+        {
+            Ok(output) if output.ok => true,
+            Ok(output) => {
+                self.log_command_failure(
+                    "iptables-restore local IP refresh failed",
+                    restore_cmd(family),
+                    &args,
+                    &output,
+                );
+                false
+            }
+            Err(err) => {
+                logger::warn_key(
+                    self.config,
+                    LogKey::CommandFailure,
+                    &[
+                        logger::command_stage_arg(
+                            "stage",
+                            "iptables-restore local IP refresh failed",
+                        ),
+                        arg("command", restore_cmd(family)),
+                        arg("error", err),
+                    ],
+                );
+                false
+            }
+        }
     }
 
     pub(super) fn append_local_ip_ruleset(
@@ -213,10 +263,6 @@ impl<'a> RuleManager<'a> {
     }
 
     pub(super) fn bypass_subnets(&self, family: Family) -> Vec<String> {
-        // Memoize per family: `ip addr show` output is stable for the duration of
-        // a single apply/clear/renew, and these are queried several times per
-        // family/chain. The old shell collected the subnet arrays once at script
-        // load; the first Rust rewrite re-forked `ip` on every call.
         let cell = match family {
             Family::V4 => &self.bypass_subnets_v4,
             Family::V6 => &self.bypass_subnets_v6,
@@ -254,10 +300,6 @@ impl<'a> RuleManager<'a> {
     }
 
     pub(super) fn local_ip_cidrs(&self, family: Family) -> Vec<String> {
-        // Memoized for the same reason as `bypass_subnets`: `ensure_local_ip_chain`
-        // is invoked once per (BOX_EXTERNAL, BOX_LOCAL) chain within the same
-        // table/family, so without the cache the identical `ip -o addr show` ran
-        // twice (plus more from `refresh_local_ip_rules`).
         let cell = match family {
             Family::V4 => &self.local_cidrs_v4,
             Family::V6 => &self.local_cidrs_v6,
@@ -317,4 +359,22 @@ impl<'a> RuleManager<'a> {
             ipv6.join(",")
         )
     }
+}
+
+fn local_ip_restore_input(table: &str, chain: &str, cidrs: &[String]) -> String {
+    let mut input = format!("*{table}\n-F {chain}\n");
+    for cidr in cidrs {
+        input.push_str("-A ");
+        input.push_str(chain);
+        input.push_str(" -d ");
+        input.push_str(cidr);
+        input.push_str(" -p udp ! --dport 53 -j ACCEPT\n");
+        input.push_str("-A ");
+        input.push_str(chain);
+        input.push_str(" -d ");
+        input.push_str(cidr);
+        input.push_str(" ! -p udp -j ACCEPT\n");
+    }
+    input.push_str("COMMIT\n");
+    input
 }
